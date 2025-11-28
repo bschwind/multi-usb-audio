@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 cpal = "0.16"
+oneringbuf = "0.6.0"
+rubato = { version = "0.16", default-features = false }

@@ -72,6 +72,7 @@ fn main() -> Result<()> {
 
             let input_stream = InputStream {
                 device_name: device_name.clone(),
+                num_channels: stream_config.channels as usize,
                 stream,
                 total_samples: sample_count,
                 last_samples: 0,
@@ -91,29 +92,31 @@ fn main() -> Result<()> {
             stream_config.buffer_size = BufferSize::Fixed(480);
 
             let timeout = None;
+            let sample_count = Arc::new(AtomicU64::new(0));
+            let sample_count_clone = Arc::clone(&sample_count);
 
             let stream = match output_format {
                 cpal::SampleFormat::I8 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<i8>(data),
+                    move |data, _| handle_output_data::<i8>(data, Arc::clone(&sample_count_clone)),
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::I16 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<i16>(data),
+                    move |data, _| handle_output_data::<i16>(data, Arc::clone(&sample_count_clone)),
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::I32 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<i32>(data),
+                    move |data, _| handle_output_data::<i32>(data, Arc::clone(&sample_count_clone)),
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::F32 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<f32>(data),
+                    move |data, _| handle_output_data::<f32>(data, Arc::clone(&sample_count_clone)),
                     |_| {},
                     timeout,
                 ),
@@ -122,8 +125,9 @@ fn main() -> Result<()> {
 
             let output_stream = OutputStream {
                 device_name: device_name.clone(),
+                num_channels: stream_config.channels as usize,
                 stream,
-                total_samples: Arc::new(AtomicU64::new(0)),
+                total_samples: sample_count,
                 last_samples: 0,
             };
 
@@ -171,6 +175,7 @@ impl AudioSystem {
 
 pub struct InputStream {
     device_name: String,
+    num_channels: usize,
     stream: cpal::Stream,
     total_samples: Arc<AtomicU64>,
     last_samples: u64,
@@ -178,6 +183,7 @@ pub struct InputStream {
 
 pub struct OutputStream {
     device_name: String,
+    num_channels: usize,
     stream: cpal::Stream,
     total_samples: Arc<AtomicU64>,
     last_samples: u64,
@@ -196,12 +202,12 @@ where
     }
 }
 
-fn handle_output_data<T>(output: &mut [T])
+fn handle_output_data<T>(output: &mut [T], sample_count: Arc<AtomicU64>)
 where
     T: Sample + cpal::FromSample<f32>,
 {
     // dbg!(output.len());
-    // sample_count.fetch_add(input.len() as u64, Ordering::Relaxed);
+    sample_count.fetch_add(output.len() as u64, Ordering::Relaxed);
 
     for sample in output {
         *sample = 0.0.to_sample();
