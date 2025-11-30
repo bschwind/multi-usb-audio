@@ -1,7 +1,13 @@
 use anyhow::Result;
 use cpal::{
-    BufferSize, Sample, StreamConfig,
+    BufferSize, InputCallbackInfo, OutputCallbackInfo, Sample, StreamConfig,
     traits::{DeviceTrait, HostTrait},
+};
+use oneringbuf::{
+    OneRingBuf, SharedHeapRB,
+    iterators::{ConsIter, ProdIter},
+    iters_components::SharedComp,
+    storage_components::HeapStorage,
 };
 use std::{
     sync::{
@@ -10,6 +16,9 @@ use std::{
     },
     time::Duration,
 };
+
+type RingBufferTx = ProdIter<OneRingBuf<HeapStorage<f32>, SharedComp>>;
+type RingBufferRx = ConsIter<OneRingBuf<HeapStorage<f32>, SharedComp>>;
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
@@ -39,31 +48,48 @@ fn main() -> Result<()> {
             // stream_config.sample_rate = cpal::SampleRate(44100);
             stream_config.buffer_size = BufferSize::Fixed(480);
 
-            let sample_count = Arc::new(AtomicU64::new(0));
-            let sample_count_clone = Arc::clone(&sample_count);
+            let frame_count = Arc::new(AtomicU64::new(0));
+            let num_channels = stream_config.channels as usize;
+
+            let ring_buf = SharedHeapRB::default(480 * num_channels);
+            let (ring_tx, ring_rx) = ring_buf.split();
+
+            let mut stream_callback = InputStreamCallback {
+                num_channels,
+                ring_tx,
+                frame_count: Arc::clone(&frame_count),
+            };
 
             let stream = match input_format {
                 cpal::SampleFormat::I8 => device.build_input_stream(
                     &stream_config,
-                    move |data, _| handle_input_data::<i8>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<i8>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::I16 => device.build_input_stream(
                     &stream_config,
-                    move |data, _| handle_input_data::<i16>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<i16>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::I32 => device.build_input_stream(
                     &stream_config,
-                    move |data, _| handle_input_data::<i32>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<i32>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::F32 => device.build_input_stream(
                     &stream_config,
-                    move |data, _| handle_input_data::<f32>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<f32>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
@@ -73,9 +99,11 @@ fn main() -> Result<()> {
             let input_stream = InputStream {
                 device_name: device_name.clone(),
                 num_channels: stream_config.channels as usize,
+                sample_rate: stream_config.sample_rate.0 as usize,
                 stream,
-                total_samples: sample_count,
-                last_samples: 0,
+                ring_rx,
+                total_frames: frame_count,
+                last_frames: 0,
             };
 
             input_streams.push(input_stream);
@@ -92,31 +120,48 @@ fn main() -> Result<()> {
             stream_config.buffer_size = BufferSize::Fixed(480);
 
             let timeout = None;
-            let sample_count = Arc::new(AtomicU64::new(0));
-            let sample_count_clone = Arc::clone(&sample_count);
+            let frame_count = Arc::new(AtomicU64::new(0));
+            let num_channels = stream_config.channels as usize;
+
+            let ring_buf = SharedHeapRB::default(480 * num_channels);
+            let (ring_tx, ring_rx) = ring_buf.split();
+
+            let mut stream_callback = OutputStreamCallback {
+                num_channels,
+                ring_rx,
+                frame_count: Arc::clone(&frame_count),
+            };
 
             let stream = match output_format {
                 cpal::SampleFormat::I8 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<i8>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<i8>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::I16 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<i16>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<i16>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::I32 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<i32>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<i16>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
                 cpal::SampleFormat::F32 => device.build_output_stream(
                     &stream_config,
-                    move |data, _| handle_output_data::<f32>(data, Arc::clone(&sample_count_clone)),
+                    move |data, callback_info| {
+                        stream_callback.process::<i16>(data, callback_info);
+                    },
                     |_| {},
                     timeout,
                 ),
@@ -126,9 +171,11 @@ fn main() -> Result<()> {
             let output_stream = OutputStream {
                 device_name: device_name.clone(),
                 num_channels: stream_config.channels as usize,
+                sample_rate: stream_config.sample_rate.0 as usize,
                 stream,
-                total_samples: sample_count,
-                last_samples: 0,
+                ring_tx,
+                total_frames: frame_count,
+                last_frames: 0,
             };
 
             output_streams.push(output_stream);
@@ -153,19 +200,19 @@ impl AudioSystem {
 
         while now.elapsed() < Duration::from_secs(10) {
             for stream in &mut self.input_streams {
-                let total_samples = stream.total_samples.load(Ordering::Relaxed);
-                let diff = total_samples - stream.last_samples;
-                println!("Stream '{}' samples: {} (+{})", stream.device_name, total_samples, diff);
+                let total_frames = stream.total_frames.load(Ordering::Relaxed);
+                let diff = total_frames - stream.last_frames;
+                println!("Stream '{}' frames: {} (+{})", stream.device_name, total_frames, diff);
 
-                stream.last_samples = total_samples;
+                stream.last_frames = total_frames;
             }
 
             for stream in &mut self.output_streams {
-                let total_samples = stream.total_samples.load(Ordering::Relaxed);
-                let diff = total_samples - stream.last_samples;
-                println!("Stream '{}' samples: {} (+{})", stream.device_name, total_samples, diff);
+                let total_frames = stream.total_frames.load(Ordering::Relaxed);
+                let diff = total_frames - stream.last_frames;
+                println!("Stream '{}' frames: {} (+{})", stream.device_name, total_frames, diff);
 
-                stream.last_samples = total_samples;
+                stream.last_frames = total_frames;
             }
 
             std::thread::sleep(Duration::from_secs(1));
@@ -176,40 +223,60 @@ impl AudioSystem {
 pub struct InputStream {
     device_name: String,
     num_channels: usize,
+    sample_rate: usize,
     stream: cpal::Stream,
-    total_samples: Arc<AtomicU64>,
-    last_samples: u64,
+    ring_rx: RingBufferRx,
+    total_frames: Arc<AtomicU64>,
+    last_frames: u64,
+}
+
+pub struct InputStreamCallback {
+    num_channels: usize,
+    ring_tx: RingBufferTx,
+    frame_count: Arc<AtomicU64>,
+}
+
+impl InputStreamCallback {
+    pub fn process<T>(&mut self, input: &[T], _callback_info: &InputCallbackInfo)
+    where
+        T: Sample,
+        f32: cpal::FromSample<T>,
+    {
+        // dbg!(input.len());
+        self.frame_count.fetch_add((input.len() / self.num_channels) as u64, Ordering::Relaxed);
+
+        for sample in input {
+            let _float_sample = sample.to_sample::<f32>();
+        }
+    }
 }
 
 pub struct OutputStream {
     device_name: String,
     num_channels: usize,
+    sample_rate: usize,
     stream: cpal::Stream,
-    total_samples: Arc<AtomicU64>,
-    last_samples: u64,
+    ring_tx: RingBufferTx,
+    total_frames: Arc<AtomicU64>,
+    last_frames: u64,
 }
 
-fn handle_input_data<T>(input: &[T], sample_count: Arc<AtomicU64>)
-where
-    T: Sample,
-    f32: cpal::FromSample<T>,
-{
-    // dbg!(input.len());
-    sample_count.fetch_add(input.len() as u64, Ordering::Relaxed);
-
-    for sample in input {
-        let _float_sample = sample.to_sample::<f32>();
-    }
+pub struct OutputStreamCallback {
+    num_channels: usize,
+    ring_rx: RingBufferRx,
+    frame_count: Arc<AtomicU64>,
 }
 
-fn handle_output_data<T>(output: &mut [T], sample_count: Arc<AtomicU64>)
-where
-    T: Sample + cpal::FromSample<f32>,
-{
-    // dbg!(output.len());
-    sample_count.fetch_add(output.len() as u64, Ordering::Relaxed);
+impl OutputStreamCallback {
+    pub fn process<T>(&mut self, output: &mut [T], _callback_info: &OutputCallbackInfo)
+    where
+        T: Sample + cpal::FromSample<f32>,
+    {
+        // dbg!(output.len());
+        self.frame_count.fetch_add((output.len() / self.num_channels) as u64, Ordering::Relaxed);
 
-    for sample in output {
-        *sample = 0.0.to_sample();
+        for sample in output {
+            *sample = 0.0.to_sample();
+        }
     }
 }
