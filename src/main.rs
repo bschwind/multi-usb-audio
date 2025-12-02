@@ -3,22 +3,20 @@ use cpal::{
     BufferSize, InputCallbackInfo, OutputCallbackInfo, Sample, StreamConfig,
     traits::{DeviceTrait, HostTrait},
 };
-use oneringbuf::{
-    OneRingBuf, SharedHeapRB,
-    iterators::{ConsIter, ProdIter},
-    iters_components::SharedComp,
-    storage_components::HeapStorage,
+use ringbuf::{
+    CachingCons, CachingProd, HeapRb,
+    traits::{Consumer, Producer, Split},
 };
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-type RingBufferTx = ProdIter<OneRingBuf<HeapStorage<f32>, SharedComp>>;
-type RingBufferRx = ConsIter<OneRingBuf<HeapStorage<f32>, SharedComp>>;
+type RingBufferTx = CachingProd<Arc<HeapRb<f32>>>;
+type RingBufferRx = CachingCons<Arc<HeapRb<f32>>>;
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
@@ -33,9 +31,10 @@ fn main() -> Result<()> {
     for device in devices {
         let device_name = device.name()?;
         dbg!(&device_name);
+        dbg!(device.supports_input());
+        dbg!(device.supports_output());
 
         if device.supports_input() && device_name == target_input_device {
-            println!("Supports input!");
             let device_config = device.default_input_config()?;
 
             let timeout = None;
@@ -51,7 +50,7 @@ fn main() -> Result<()> {
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let ring_buf = SharedHeapRB::default(480 * num_channels);
+            let ring_buf = HeapRb::new((480 * num_channels) * 4);
             let (ring_tx, ring_rx) = ring_buf.split();
 
             let mut stream_callback = InputStreamCallback {
@@ -110,20 +109,20 @@ fn main() -> Result<()> {
         }
 
         if device.supports_output() && device_name == target_output_device {
-            println!("Supports output!");
             let device_config = device.default_output_config()?;
 
             let output_format = device_config.sample_format();
             let mut stream_config: StreamConfig = device_config.into();
             dbg!(&stream_config);
 
+            stream_config.channels = 2;
             stream_config.buffer_size = BufferSize::Fixed(480);
 
             let timeout = None;
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let ring_buf = SharedHeapRB::default(480 * num_channels);
+            let ring_buf = HeapRb::new((480 * num_channels) * 4);
             let (ring_tx, ring_rx) = ring_buf.split();
 
             let mut stream_callback = OutputStreamCallback {
@@ -196,26 +195,46 @@ pub struct AudioSystem {
 
 impl AudioSystem {
     pub fn run(&mut self) {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
+        let mut last_print = now;
+
+        let mut input_slice = [0.0; 480];
 
         while now.elapsed() < Duration::from_secs(10) {
-            for stream in &mut self.input_streams {
-                let total_frames = stream.total_frames.load(Ordering::Relaxed);
-                let diff = total_frames - stream.last_frames;
-                println!("Stream '{}' frames: {} (+{})", stream.device_name, total_frames, diff);
+            if last_print.elapsed() >= Duration::from_secs(1) {
+                for stream in &mut self.input_streams {
+                    let total_frames = stream.total_frames.load(Ordering::Relaxed);
+                    let diff = total_frames - stream.last_frames;
+                    println!(
+                        "Stream '{}' frames: {} (+{})",
+                        stream.device_name, total_frames, diff
+                    );
 
-                stream.last_frames = total_frames;
+                    stream.last_frames = total_frames;
+                }
+
+                for stream in &mut self.output_streams {
+                    let total_frames = stream.total_frames.load(Ordering::Relaxed);
+                    let diff = total_frames - stream.last_frames;
+                    println!(
+                        "Stream '{}' frames: {} (+{})",
+                        stream.device_name, total_frames, diff
+                    );
+
+                    stream.last_frames = total_frames;
+                }
+
+                last_print = Instant::now();
             }
 
-            for stream in &mut self.output_streams {
-                let total_frames = stream.total_frames.load(Ordering::Relaxed);
-                let diff = total_frames - stream.last_frames;
-                println!("Stream '{}' frames: {} (+{})", stream.device_name, total_frames, diff);
+            let num = self.input_streams[0].ring_rx.pop_slice(&mut input_slice);
 
-                stream.last_frames = total_frames;
+            for sample in &input_slice[..num] {
+                let _ = self.output_streams[0].ring_tx.try_push(*sample);
+                let _ = self.output_streams[0].ring_tx.try_push(*sample);
             }
 
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -246,7 +265,10 @@ impl InputStreamCallback {
         self.frame_count.fetch_add((input.len() / self.num_channels) as u64, Ordering::Relaxed);
 
         for sample in input {
-            let _float_sample = sample.to_sample::<f32>();
+            let float_sample = sample.to_sample::<f32>();
+            if let Err(_e) = self.ring_tx.try_push(float_sample) {
+                // println!("Error on input stream: {e:?}");
+            }
         }
     }
 }
@@ -276,7 +298,7 @@ impl OutputStreamCallback {
         self.frame_count.fetch_add((output.len() / self.num_channels) as u64, Ordering::Relaxed);
 
         for sample in output {
-            *sample = 0.0.to_sample();
+            *sample = self.ring_rx.try_pop().unwrap_or(0.0).to_sample();
         }
     }
 }
