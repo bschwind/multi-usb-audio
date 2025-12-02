@@ -5,7 +5,10 @@ use cpal::{
 };
 use ringbuf::{
     CachingCons, CachingProd, HeapRb,
-    traits::{Consumer, Producer, Split},
+    traits::{Consumer, Observer, Producer, Split},
+};
+use rubato::{
+    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::{
     sync::{
@@ -14,6 +17,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+const CPAL_BUFFER_SIZE: usize = 480;
 
 type RingBufferTx = CachingProd<Arc<HeapRb<f32>>>;
 type RingBufferRx = CachingCons<Arc<HeapRb<f32>>>;
@@ -45,12 +50,12 @@ fn main() -> Result<()> {
 
             stream_config.channels = 1;
             // stream_config.sample_rate = cpal::SampleRate(44100);
-            stream_config.buffer_size = BufferSize::Fixed(480);
+            stream_config.buffer_size = BufferSize::Fixed(CPAL_BUFFER_SIZE as u32);
 
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let ring_buf = HeapRb::new((480 * num_channels) * 4);
+            let ring_buf = HeapRb::new((CPAL_BUFFER_SIZE * num_channels) * 4);
             let (ring_tx, ring_rx) = ring_buf.split();
 
             let mut stream_callback = InputStreamCallback {
@@ -95,12 +100,35 @@ fn main() -> Result<()> {
                 _ => panic!("oh no"),
             }?;
 
+            let sample_rate = stream_config.sample_rate.0 as usize;
+
+            let resample_ratio = 48_000.0f64 / sample_rate as f64;
+            let max_relative_resample_ratio = 1.1;
+            let params = SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                oversampling_factor: 128,
+                interpolation: SincInterpolationType::Cubic,
+                window: WindowFunction::Blackman,
+            };
+            let chunk_size = 480;
+
+            let resampler = SincFixedOut::new(
+                resample_ratio,
+                max_relative_resample_ratio,
+                params,
+                chunk_size,
+                num_channels,
+            )
+            .expect("Should be able to construct the resampler");
+
             let input_stream = InputStream {
                 device_name: device_name.clone(),
                 num_channels: stream_config.channels as usize,
                 sample_rate: stream_config.sample_rate.0 as usize,
                 stream,
                 ring_rx,
+                resampler: Some(InputResampler::new(resampler)),
                 total_frames: frame_count,
                 last_frames: 0,
             };
@@ -116,13 +144,13 @@ fn main() -> Result<()> {
             dbg!(&stream_config);
 
             stream_config.channels = 2;
-            stream_config.buffer_size = BufferSize::Fixed(480);
+            stream_config.buffer_size = BufferSize::Fixed(CPAL_BUFFER_SIZE as u32);
 
             let timeout = None;
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let ring_buf = HeapRb::new((480 * num_channels) * 4);
+            let ring_buf = HeapRb::new((CPAL_BUFFER_SIZE * num_channels) * 4);
             let (ring_tx, ring_rx) = ring_buf.split();
 
             let mut stream_callback = OutputStreamCallback {
@@ -198,8 +226,6 @@ impl AudioSystem {
         let now = Instant::now();
         let mut last_print = now;
 
-        let mut input_slice = [0.0; 480];
-
         while now.elapsed() < Duration::from_secs(10) {
             if last_print.elapsed() >= Duration::from_secs(1) {
                 for stream in &mut self.input_streams {
@@ -227,11 +253,30 @@ impl AudioSystem {
                 last_print = Instant::now();
             }
 
-            let num = self.input_streams[0].ring_rx.pop_slice(&mut input_slice);
+            let first_input_stream = &mut self.input_streams[0];
 
-            for sample in &input_slice[..num] {
-                let _ = self.output_streams[0].ring_tx.try_push(*sample);
-                let _ = self.output_streams[0].ring_tx.try_push(*sample);
+            if let Some(resampler) = &mut first_input_stream.resampler {
+                let input_frames_needed = resampler.resampler.input_frames_next();
+
+                // If our input ring buffer has enough samples for the resampler, then resample into the output buffer.
+                if first_input_stream.ring_rx.occupied_len() >= input_frames_needed {
+                    let _num = first_input_stream
+                        .ring_rx
+                        .pop_slice(&mut resampler.input_buffer[0][..input_frames_needed]);
+
+                    if let Err(e) = resampler.resampler.process_into_buffer(
+                        &resampler.input_buffer,
+                        &mut resampler.output_buffer,
+                        None,
+                    ) {
+                        println!("Resampler error: {e}");
+                    } else {
+                        for sample in &resampler.output_buffer[0][..480] {
+                            let _ = self.output_streams[0].ring_tx.try_push(*sample);
+                            let _ = self.output_streams[0].ring_tx.try_push(*sample);
+                        }
+                    }
+                }
             }
 
             std::thread::sleep(Duration::from_millis(1));
@@ -245,6 +290,7 @@ pub struct InputStream {
     sample_rate: usize,
     stream: cpal::Stream,
     ring_rx: RingBufferRx,
+    resampler: Option<InputResampler>,
     total_frames: Arc<AtomicU64>,
     last_frames: u64,
 }
@@ -273,6 +319,25 @@ impl InputStreamCallback {
     }
 }
 
+pub struct InputResampler {
+    resampler: SincFixedOut<f32>,
+    input_buffer: Vec<Vec<f32>>,
+    output_buffer: Vec<Vec<f32>>,
+}
+
+impl InputResampler {
+    pub fn new(resampler: SincFixedOut<f32>) -> Self {
+        let filled = true;
+        let input_buffer = resampler.input_buffer_allocate(filled);
+        let output_buffer = resampler.output_buffer_allocate(filled);
+
+        dbg!(input_buffer[0].capacity());
+        dbg!(output_buffer[0].capacity());
+
+        Self { resampler, input_buffer, output_buffer }
+    }
+}
+
 pub struct OutputStream {
     device_name: String,
     num_channels: usize,
@@ -294,11 +359,37 @@ impl OutputStreamCallback {
     where
         T: Sample + cpal::FromSample<f32>,
     {
+        let mut did_underrun = false;
         // dbg!(output.len());
         self.frame_count.fetch_add((output.len() / self.num_channels) as u64, Ordering::Relaxed);
 
         for sample in output {
-            *sample = self.ring_rx.try_pop().unwrap_or(0.0).to_sample();
+            if let Some(popped) = self.ring_rx.try_pop() {
+                *sample = popped.to_sample();
+            } else {
+                did_underrun = true;
+                *sample = 0.0.to_sample();
+            }
+        }
+
+        if did_underrun {
+            println!("underrun");
+        }
+    }
+}
+
+fn deinterleave_into<T: AsMut<[f32]>>(data: &[f32], num_channels: usize, output: &mut [T]) {
+    assert!(data.len().is_multiple_of(num_channels));
+    assert_eq!(output.len(), num_channels);
+    for buf in output.iter_mut() {
+        assert_eq!(buf.as_mut().len(), data.len() / num_channels);
+    }
+
+    for (channel_index, channel) in output.iter_mut().enumerate() {
+        for (sample, multi_sample) in
+            channel.as_mut().iter_mut().zip(data.chunks_exact(num_channels))
+        {
+            *sample = multi_sample[channel_index];
         }
     }
 }
