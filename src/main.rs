@@ -123,7 +123,7 @@ fn main() -> Result<()> {
                 build_input_resampler(stream_config.sample_rate.0 as usize, num_channels);
 
             for _ in 0..num_channels {
-                user_input_buffers.push(vec![0.0f32; CPAL_BUFFER_SIZE]);
+                user_input_buffers.push([0.0f32; CPAL_BUFFER_SIZE]);
             }
 
             let input_stream = InputStream {
@@ -208,7 +208,7 @@ fn main() -> Result<()> {
                 build_output_resampler(stream_config.sample_rate.0 as usize, num_channels);
 
             for _ in 0..num_channels {
-                user_output_buffers.push(vec![0.0f32; CPAL_BUFFER_SIZE]);
+                user_output_buffers.push([0.0f32; CPAL_BUFFER_SIZE]);
             }
 
             let output_stream = OutputStream {
@@ -241,10 +241,10 @@ pub struct AudioSystem {
     input_streams: Vec<InputStream>,
     output_streams: Vec<OutputStream>,
     // An aggregate of all input audio channels after sample conversion and resampling.
-    user_input_buffers: Vec<Vec<f32>>,
+    user_input_buffers: Vec<[f32; CPAL_BUFFER_SIZE]>,
     // An aggregate of all output audio channels in f32, 48kHz format, before sample
     // conversion and resampling.
-    user_output_buffers: Vec<Vec<f32>>,
+    user_output_buffers: Vec<[f32; CPAL_BUFFER_SIZE]>,
 }
 
 impl AudioSystem {
@@ -291,14 +291,18 @@ impl AudioSystem {
                 last_print = Instant::now();
             }
 
+            let mut should_output = false;
+
             for input_stream in &mut self.input_streams {
                 let input_frames_needed = input_stream.resampler.resampler.input_frames_next();
 
                 // If our input ring buffer has enough samples for the resampler, then resample into the output buffer.
+                // TODO(bschwind) - It would be better to clock this on a driver device instead of depending on ring buffer fill.
                 if !input_stream.has_errored
                     && input_stream.sample_rx.occupied_len()
                         >= input_frames_needed * input_stream.num_channels
                 {
+                    should_output = true;
                     deinterleave_from_ring_buf(
                         input_stream.sample_rx.pop_iter(),
                         input_stream.num_channels,
@@ -318,21 +322,35 @@ impl AudioSystem {
                         println!("Resampler error: {e}");
                     } else {
                         // user_input_buffer is now ready for this stream
-
-                        // for sample in user_input_buffer[0][..480] {
-                        //     let _ = self.output_streams[0].sample_tx.try_push(*sample);
-                        //     let _ = self.output_streams[0].sample_tx.try_push(*sample);
-                        // }
                     }
                 } else if input_stream.has_errored {
                 }
             }
 
-            // Run the big mix function
+            if should_output {
+                big_mix(&self.user_input_buffers, &mut self.user_output_buffers);
 
-            // Resample the output
+                // TODO(bschwind) - Resample the output
+
+                // For now, just forward the user output buffers to the ring buffers, in an interleaved fashion.
+                for sample_idx in 0..CPAL_BUFFER_SIZE {
+                    for out_channel in &self.user_output_buffers {
+                        let _ = self.output_streams[0].sample_tx.try_push(out_channel[sample_idx]);
+                    }
+                }
+            }
 
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+// Given audio on all input channels, write the resulting audio to the output channels.
+// For now it does a simple loopback.
+fn big_mix(inputs: &[[f32; CPAL_BUFFER_SIZE]], outputs: &mut [[f32; CPAL_BUFFER_SIZE]]) {
+    for input_channel in inputs {
+        for output_channel in &mut *outputs {
+            output_channel.copy_from_slice(input_channel);
         }
     }
 }
@@ -450,7 +468,7 @@ fn deinterleave_into<T: AsMut<[f32]>>(data: &[f32], num_channels: usize, output:
 fn deinterleave_from_ring_buf<T: AsMut<[f32]>>(
     mut pop_iter: PopIter<RingBufferRx<f32>>,
     num_channels: usize,
-    frames_needs: usize,
+    frames_needed: usize,
     output: &mut [T],
 ) {
     // assert!(pop_iter.len().is_multiple_of(num_channels));
@@ -459,7 +477,7 @@ fn deinterleave_from_ring_buf<T: AsMut<[f32]>>(
     //     assert_eq!(buf.as_mut().len(), pop_iter.len() / num_channels);
     // }
 
-    for i in 0..frames_needs {
+    for i in 0..frames_needed {
         for channel in output.iter_mut() {
             channel.as_mut()[i] = pop_iter.next().expect("PopIter should have enough elements");
         }
@@ -478,7 +496,7 @@ fn build_input_resampler(sample_rate: usize, num_channels: usize) -> SincFixedOu
         interpolation: SincInterpolationType::Cubic,
         window: WindowFunction::Blackman,
     };
-    let chunk_size = 480;
+    let chunk_size = CPAL_BUFFER_SIZE;
 
     SincFixedOut::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
         .expect("Should be able to construct the resampler")
@@ -494,7 +512,7 @@ fn build_output_resampler(sample_rate: usize, num_channels: usize) -> SincFixedI
         interpolation: SincInterpolationType::Cubic,
         window: WindowFunction::Blackman,
     };
-    let chunk_size = 480;
+    let chunk_size = CPAL_BUFFER_SIZE;
 
     SincFixedIn::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
         .expect("Should be able to construct the resampler")
