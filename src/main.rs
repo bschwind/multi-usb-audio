@@ -188,7 +188,7 @@ fn main() -> Result<()> {
                 cpal::SampleFormat::I32 => device.build_output_stream(
                     &stream_config,
                     move |data, callback_info| {
-                        stream_callback.process::<i16>(data, callback_info);
+                        stream_callback.process::<i32>(data, callback_info);
                     },
                     |_| {},
                     timeout,
@@ -196,7 +196,7 @@ fn main() -> Result<()> {
                 cpal::SampleFormat::F32 => device.build_output_stream(
                     &stream_config,
                     move |data, callback_info| {
-                        stream_callback.process::<i16>(data, callback_info);
+                        stream_callback.process::<f32>(data, callback_info);
                     },
                     |_| {},
                     timeout,
