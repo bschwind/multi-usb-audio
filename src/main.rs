@@ -1,14 +1,16 @@
 use anyhow::Result;
 use cpal::{
-    BufferSize, InputCallbackInfo, OutputCallbackInfo, Sample, StreamConfig,
+    BufferSize, InputCallbackInfo, OutputCallbackInfo, Sample, StreamConfig, StreamError,
     traits::{DeviceTrait, HostTrait},
 };
 use ringbuf::{
     CachingCons, CachingProd, HeapRb,
+    consumer::PopIter,
     traits::{Consumer, Observer, Producer, Split},
 };
 use rubato::{
-    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Resampler, SincFixedIn, SincFixedOut, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
 use std::{
     sync::{
@@ -19,9 +21,10 @@ use std::{
 };
 
 const CPAL_BUFFER_SIZE: usize = 480;
+const ERROR_BUFFER_SIZE: usize = 10;
 
-type RingBufferTx = CachingProd<Arc<HeapRb<f32>>>;
-type RingBufferRx = CachingCons<Arc<HeapRb<f32>>>;
+type RingBufferTx<T> = CachingProd<Arc<HeapRb<T>>>;
+type RingBufferRx<T> = CachingCons<Arc<HeapRb<T>>>;
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
@@ -29,6 +32,11 @@ fn main() -> Result<()> {
 
     let mut input_streams = vec![];
     let mut output_streams = vec![];
+
+    let mut user_input_buffers = vec![];
+    let mut input_buffer_index_start = 0;
+    let mut user_output_buffers = vec![];
+    let mut output_buffer_index_start = 0;
 
     let target_input_device = "Blue Snowball";
     let target_output_device = "Mac mini Speakers";
@@ -55,12 +63,15 @@ fn main() -> Result<()> {
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let ring_buf = HeapRb::new((CPAL_BUFFER_SIZE * num_channels) * 4);
-            let (ring_tx, ring_rx) = ring_buf.split();
+            let sample_ring_buf = HeapRb::new((CPAL_BUFFER_SIZE * num_channels) * 4);
+            let (sample_tx, sample_rx) = sample_ring_buf.split();
+
+            let error_ring_buf = HeapRb::new(ERROR_BUFFER_SIZE);
+            let (mut error_tx, error_rx) = error_ring_buf.split();
 
             let mut stream_callback = InputStreamCallback {
                 num_channels,
-                ring_tx,
+                sample_tx,
                 frame_count: Arc::clone(&frame_count),
             };
 
@@ -70,7 +81,9 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<i8>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 cpal::SampleFormat::I16 => device.build_input_stream(
@@ -78,7 +91,9 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<i16>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 cpal::SampleFormat::I32 => device.build_input_stream(
@@ -86,7 +101,9 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<i32>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 cpal::SampleFormat::F32 => device.build_input_stream(
@@ -94,44 +111,36 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<f32>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 _ => panic!("oh no"),
             }?;
 
-            let sample_rate = stream_config.sample_rate.0 as usize;
+            let resampler =
+                build_input_resampler(stream_config.sample_rate.0 as usize, num_channels);
 
-            let resample_ratio = 48_000.0f64 / sample_rate as f64;
-            let max_relative_resample_ratio = 1.1;
-            let params = SincInterpolationParameters {
-                sinc_len: 256,
-                f_cutoff: 0.95,
-                oversampling_factor: 128,
-                interpolation: SincInterpolationType::Cubic,
-                window: WindowFunction::Blackman,
-            };
-            let chunk_size = 480;
-
-            let resampler = SincFixedOut::new(
-                resample_ratio,
-                max_relative_resample_ratio,
-                params,
-                chunk_size,
-                num_channels,
-            )
-            .expect("Should be able to construct the resampler");
+            for _ in 0..num_channels {
+                user_input_buffers.push(vec![0.0f32; CPAL_BUFFER_SIZE]);
+            }
 
             let input_stream = InputStream {
                 device_name: device_name.clone(),
                 num_channels: stream_config.channels as usize,
                 sample_rate: stream_config.sample_rate.0 as usize,
                 stream,
-                ring_rx,
-                resampler: Some(InputResampler::new(resampler)),
+                sample_rx,
+                error_rx,
+                resampler: InputResampler::new(resampler),
                 total_frames: frame_count,
                 last_frames: 0,
+                has_errored: false,
+                input_buffer_index_start,
             };
+
+            input_buffer_index_start += stream_config.channels as usize;
 
             input_streams.push(input_stream);
         }
@@ -151,11 +160,11 @@ fn main() -> Result<()> {
             let num_channels = stream_config.channels as usize;
 
             let ring_buf = HeapRb::new((CPAL_BUFFER_SIZE * num_channels) * 4);
-            let (ring_tx, ring_rx) = ring_buf.split();
+            let (sample_tx, sample_rx) = ring_buf.split();
 
             let mut stream_callback = OutputStreamCallback {
                 num_channels,
-                ring_rx,
+                sample_rx,
                 frame_count: Arc::clone(&frame_count),
             };
 
@@ -195,21 +204,33 @@ fn main() -> Result<()> {
                 _ => panic!("oh no"),
             }?;
 
+            let resampler =
+                build_output_resampler(stream_config.sample_rate.0 as usize, num_channels);
+
+            for _ in 0..num_channels {
+                user_output_buffers.push(vec![0.0f32; CPAL_BUFFER_SIZE]);
+            }
+
             let output_stream = OutputStream {
                 device_name: device_name.clone(),
                 num_channels: stream_config.channels as usize,
                 sample_rate: stream_config.sample_rate.0 as usize,
                 stream,
-                ring_tx,
+                sample_tx,
+                resampler,
                 total_frames: frame_count,
                 last_frames: 0,
+                output_buffer_index_start,
             };
+
+            output_buffer_index_start += stream_config.channels as usize;
 
             output_streams.push(output_stream);
         }
     }
 
-    let mut audio_system = AudioSystem { input_streams, output_streams };
+    let mut audio_system =
+        AudioSystem { input_streams, output_streams, user_input_buffers, user_output_buffers };
 
     audio_system.run();
 
@@ -219,6 +240,11 @@ fn main() -> Result<()> {
 pub struct AudioSystem {
     input_streams: Vec<InputStream>,
     output_streams: Vec<OutputStream>,
+    // An aggregate of all input audio channels after sample conversion and resampling.
+    user_input_buffers: Vec<Vec<f32>>,
+    // An aggregate of all output audio channels in f32, 48kHz format, before sample
+    // conversion and resampling.
+    user_output_buffers: Vec<Vec<f32>>,
 }
 
 impl AudioSystem {
@@ -226,7 +252,19 @@ impl AudioSystem {
         let now = Instant::now();
         let mut last_print = now;
 
-        while now.elapsed() < Duration::from_secs(10) {
+        dbg!(self.user_input_buffers.len());
+        dbg!(self.user_output_buffers.len());
+
+        while now.elapsed() < Duration::from_secs(100) {
+            for stream in &mut self.input_streams {
+                if let Some(err) = stream.error_rx.try_pop() {
+                    println!("Stream {} got error: {err:?}", stream.device_name);
+                    stream.has_errored = true;
+                    // TODO(bschwind) - Mark the stream as disconnected, zero its buffers,
+                    //                  and try to recreate it.
+                }
+            }
+
             if last_print.elapsed() >= Duration::from_secs(1) {
                 for stream in &mut self.input_streams {
                     let total_frames = stream.total_frames.load(Ordering::Relaxed);
@@ -253,31 +291,46 @@ impl AudioSystem {
                 last_print = Instant::now();
             }
 
-            let first_input_stream = &mut self.input_streams[0];
-
-            if let Some(resampler) = &mut first_input_stream.resampler {
-                let input_frames_needed = resampler.resampler.input_frames_next();
+            for input_stream in &mut self.input_streams {
+                let input_frames_needed = input_stream.resampler.resampler.input_frames_next();
 
                 // If our input ring buffer has enough samples for the resampler, then resample into the output buffer.
-                if first_input_stream.ring_rx.occupied_len() >= input_frames_needed {
-                    let _num = first_input_stream
-                        .ring_rx
-                        .pop_slice(&mut resampler.input_buffer[0][..input_frames_needed]);
+                if !input_stream.has_errored
+                    && input_stream.sample_rx.occupied_len()
+                        >= input_frames_needed * input_stream.num_channels
+                {
+                    deinterleave_from_ring_buf(
+                        input_stream.sample_rx.pop_iter(),
+                        input_stream.num_channels,
+                        input_frames_needed,
+                        &mut input_stream.resampler.input_buffer,
+                    );
 
-                    if let Err(e) = resampler.resampler.process_into_buffer(
-                        &resampler.input_buffer,
-                        &mut resampler.output_buffer,
+                    let user_input_buffer = &mut self.user_input_buffers[input_stream
+                        .input_buffer_index_start
+                        ..(input_stream.input_buffer_index_start + input_stream.num_channels)];
+
+                    if let Err(e) = input_stream.resampler.resampler.process_into_buffer(
+                        &input_stream.resampler.input_buffer,
+                        user_input_buffer,
                         None,
                     ) {
                         println!("Resampler error: {e}");
                     } else {
-                        for sample in &resampler.output_buffer[0][..480] {
-                            let _ = self.output_streams[0].ring_tx.try_push(*sample);
-                            let _ = self.output_streams[0].ring_tx.try_push(*sample);
-                        }
+                        // user_input_buffer is now ready for this stream
+
+                        // for sample in user_input_buffer[0][..480] {
+                        //     let _ = self.output_streams[0].sample_tx.try_push(*sample);
+                        //     let _ = self.output_streams[0].sample_tx.try_push(*sample);
+                        // }
                     }
+                } else if input_stream.has_errored {
                 }
             }
+
+            // Run the big mix function
+
+            // Resample the output
 
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -289,15 +342,18 @@ pub struct InputStream {
     num_channels: usize,
     sample_rate: usize,
     stream: cpal::Stream,
-    ring_rx: RingBufferRx,
-    resampler: Option<InputResampler>,
+    sample_rx: RingBufferRx<f32>,
+    error_rx: RingBufferRx<StreamError>,
+    resampler: InputResampler,
     total_frames: Arc<AtomicU64>,
     last_frames: u64,
+    has_errored: bool,
+    input_buffer_index_start: usize,
 }
 
 pub struct InputStreamCallback {
     num_channels: usize,
-    ring_tx: RingBufferTx,
+    sample_tx: RingBufferTx<f32>,
     frame_count: Arc<AtomicU64>,
 }
 
@@ -312,7 +368,7 @@ impl InputStreamCallback {
 
         for sample in input {
             let float_sample = sample.to_sample::<f32>();
-            if let Err(_e) = self.ring_tx.try_push(float_sample) {
+            if let Err(_e) = self.sample_tx.try_push(float_sample) {
                 // println!("Error on input stream: {e:?}");
             }
         }
@@ -322,19 +378,14 @@ impl InputStreamCallback {
 pub struct InputResampler {
     resampler: SincFixedOut<f32>,
     input_buffer: Vec<Vec<f32>>,
-    output_buffer: Vec<Vec<f32>>,
 }
 
 impl InputResampler {
     pub fn new(resampler: SincFixedOut<f32>) -> Self {
         let filled = true;
         let input_buffer = resampler.input_buffer_allocate(filled);
-        let output_buffer = resampler.output_buffer_allocate(filled);
 
-        dbg!(input_buffer[0].capacity());
-        dbg!(output_buffer[0].capacity());
-
-        Self { resampler, input_buffer, output_buffer }
+        Self { resampler, input_buffer }
     }
 }
 
@@ -343,14 +394,16 @@ pub struct OutputStream {
     num_channels: usize,
     sample_rate: usize,
     stream: cpal::Stream,
-    ring_tx: RingBufferTx,
+    sample_tx: RingBufferTx<f32>,
+    resampler: SincFixedIn<f32>,
     total_frames: Arc<AtomicU64>,
     last_frames: u64,
+    output_buffer_index_start: usize,
 }
 
 pub struct OutputStreamCallback {
     num_channels: usize,
-    ring_rx: RingBufferRx,
+    sample_rx: RingBufferRx<f32>,
     frame_count: Arc<AtomicU64>,
 }
 
@@ -364,7 +417,7 @@ impl OutputStreamCallback {
         self.frame_count.fetch_add((output.len() / self.num_channels) as u64, Ordering::Relaxed);
 
         for sample in output {
-            if let Some(popped) = self.ring_rx.try_pop() {
+            if let Some(popped) = self.sample_rx.try_pop() {
                 *sample = popped.to_sample();
             } else {
                 did_underrun = true;
@@ -373,7 +426,7 @@ impl OutputStreamCallback {
         }
 
         if did_underrun {
-            println!("underrun");
+            // println!("underrun");
         }
     }
 }
@@ -392,4 +445,57 @@ fn deinterleave_into<T: AsMut<[f32]>>(data: &[f32], num_channels: usize, output:
             *sample = multi_sample[channel_index];
         }
     }
+}
+
+fn deinterleave_from_ring_buf<T: AsMut<[f32]>>(
+    mut pop_iter: PopIter<RingBufferRx<f32>>,
+    num_channels: usize,
+    frames_needs: usize,
+    output: &mut [T],
+) {
+    // assert!(pop_iter.len().is_multiple_of(num_channels));
+    assert_eq!(output.len(), num_channels);
+    // for buf in output.iter_mut() {
+    //     assert_eq!(buf.as_mut().len(), pop_iter.len() / num_channels);
+    // }
+
+    for i in 0..frames_needs {
+        for channel in output.iter_mut() {
+            channel.as_mut()[i] = pop_iter.next().expect("PopIter should have enough elements");
+        }
+    }
+
+    pop_iter.commit();
+}
+
+fn build_input_resampler(sample_rate: usize, num_channels: usize) -> SincFixedOut<f32> {
+    let resample_ratio = 48_000.0f64 / sample_rate as f64;
+    let max_relative_resample_ratio = 1.1;
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        oversampling_factor: 128,
+        interpolation: SincInterpolationType::Cubic,
+        window: WindowFunction::Blackman,
+    };
+    let chunk_size = 480;
+
+    SincFixedOut::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
+        .expect("Should be able to construct the resampler")
+}
+
+fn build_output_resampler(sample_rate: usize, num_channels: usize) -> SincFixedIn<f32> {
+    let resample_ratio = sample_rate as f64 / 48_000.0f64;
+    let max_relative_resample_ratio = 1.1;
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        oversampling_factor: 128,
+        interpolation: SincInterpolationType::Cubic,
+        window: WindowFunction::Blackman,
+    };
+    let chunk_size = 480;
+
+    SincFixedIn::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
+        .expect("Should be able to construct the resampler")
 }
