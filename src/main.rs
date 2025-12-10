@@ -218,7 +218,7 @@ fn main() -> Result<()> {
                 sample_rate: stream_config.sample_rate.0 as usize,
                 stream,
                 sample_tx,
-                resampler,
+                resampler: OutputResampler::new(resampler),
                 total_frames: frame_count,
                 last_frames: 0,
                 output_buffer_index_start,
@@ -315,14 +315,18 @@ impl AudioSystem {
                         .input_buffer_index_start
                         ..(input_stream.input_buffer_index_start + input_stream.num_channels)];
 
-                    if let Err(e) = input_stream.resampler.resampler.process_into_buffer(
+                    match input_stream.resampler.resampler.process_into_buffer(
                         &input_stream.resampler.input_buffer,
                         user_input_buffer,
                         None,
                     ) {
-                        println!("Resampler error: {e}");
-                    } else {
-                        // user_input_buffer is now ready for this stream
+                        Ok((_input_frames, _output_frames)) => {
+                            // user_input_buffer is now ready for this stream
+                            // TODO(bschwind) - Assert `input_frames` is the same as `input_frames_needed`.
+                        },
+                        Err(e) => {
+                            println!("Resampler error: {e}");
+                        },
                     }
                 } else if input_stream.has_errored {
                 }
@@ -331,12 +335,29 @@ impl AudioSystem {
             if should_output {
                 big_mix(&self.user_input_buffers, &mut self.user_output_buffers);
 
-                // TODO(bschwind) - Resample the output
+                // Resample the output
+                for output_stream in &mut self.output_streams {
+                    let user_output_buffer = &mut self.user_output_buffers[output_stream
+                        .output_buffer_index_start
+                        ..(output_stream.output_buffer_index_start + output_stream.num_channels)];
 
-                // For now, just forward the user output buffers to the ring buffers, in an interleaved fashion.
-                for sample_idx in 0..CPAL_BUFFER_SIZE {
-                    for out_channel in &self.user_output_buffers {
-                        let _ = self.output_streams[0].sample_tx.try_push(out_channel[sample_idx]);
+                    match output_stream.resampler.resampler.process_into_buffer(
+                        user_output_buffer,
+                        &mut output_stream.resampler.output_buffer,
+                        None,
+                    ) {
+                        Ok((_input_frames, output_frames)) => {
+                            // Interleave the output channels for this device into the output stream's ring buffer.
+                            for sample_idx in 0..output_frames {
+                                for out_channel in &self.user_output_buffers {
+                                    let _ =
+                                        output_stream.sample_tx.try_push(out_channel[sample_idx]);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            println!("Resampler error: {e}");
+                        },
                     }
                 }
             }
@@ -408,13 +429,27 @@ impl InputResampler {
     }
 }
 
+pub struct OutputResampler {
+    resampler: SincFixedIn<f32>,
+    output_buffer: Vec<Vec<f32>>,
+}
+
+impl OutputResampler {
+    pub fn new(resampler: SincFixedIn<f32>) -> Self {
+        let filled = true;
+        let output_buffer = resampler.output_buffer_allocate(filled);
+
+        Self { resampler, output_buffer }
+    }
+}
+
 pub struct OutputStream {
     device_name: String,
     num_channels: usize,
     sample_rate: usize,
     stream: cpal::Stream,
     sample_tx: RingBufferTx<f32>,
-    resampler: SincFixedIn<f32>,
+    resampler: OutputResampler,
     total_frames: Arc<AtomicU64>,
     last_frames: u64,
     output_buffer_index_start: usize,
@@ -432,7 +467,6 @@ impl OutputStreamCallback {
         T: Sample + cpal::FromSample<f32>,
     {
         let mut did_underrun = false;
-        // dbg!(output.len());
         self.frame_count.fetch_add((output.len() / self.num_channels) as u64, Ordering::Relaxed);
 
         for sample in output {
@@ -445,7 +479,7 @@ impl OutputStreamCallback {
         }
 
         if did_underrun {
-            // println!("underrun");
+            println!("underrun");
         }
     }
 }
