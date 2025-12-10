@@ -20,7 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CPAL_BUFFER_SIZE: usize = 480;
+const CPAL_BUFFER_SIZE: usize = 128;
+const USER_BUFFER_SIZE: usize = 480;
 const ERROR_BUFFER_SIZE: usize = 10;
 
 type RingBufferTx<T> = CachingProd<Arc<HeapRb<T>>>;
@@ -63,7 +64,7 @@ fn main() -> Result<()> {
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let sample_ring_buf = HeapRb::new((CPAL_BUFFER_SIZE * num_channels) * 4);
+            let sample_ring_buf = HeapRb::new((USER_BUFFER_SIZE * num_channels) * 4);
             let (sample_tx, sample_rx) = sample_ring_buf.split();
 
             let error_ring_buf = HeapRb::new(ERROR_BUFFER_SIZE);
@@ -123,7 +124,7 @@ fn main() -> Result<()> {
                 build_input_resampler(stream_config.sample_rate.0 as usize, num_channels);
 
             for _ in 0..num_channels {
-                user_input_buffers.push([0.0f32; CPAL_BUFFER_SIZE]);
+                user_input_buffers.push([0.0f32; USER_BUFFER_SIZE]);
             }
 
             let input_stream = InputStream {
@@ -159,7 +160,7 @@ fn main() -> Result<()> {
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let ring_buf = HeapRb::new((CPAL_BUFFER_SIZE * num_channels) * 4);
+            let ring_buf = HeapRb::new((USER_BUFFER_SIZE * num_channels) * 4);
             let (sample_tx, sample_rx) = ring_buf.split();
 
             let mut stream_callback = OutputStreamCallback {
@@ -208,7 +209,7 @@ fn main() -> Result<()> {
                 build_output_resampler(stream_config.sample_rate.0 as usize, num_channels);
 
             for _ in 0..num_channels {
-                user_output_buffers.push([0.0f32; CPAL_BUFFER_SIZE]);
+                user_output_buffers.push([0.0f32; USER_BUFFER_SIZE]);
             }
 
             let output_stream = OutputStream {
@@ -241,10 +242,10 @@ pub struct AudioSystem {
     input_streams: Vec<InputStream>,
     output_streams: Vec<OutputStream>,
     // An aggregate of all input audio channels after sample conversion and resampling.
-    user_input_buffers: Vec<[f32; CPAL_BUFFER_SIZE]>,
+    user_input_buffers: Vec<[f32; USER_BUFFER_SIZE]>,
     // An aggregate of all output audio channels in f32, 48kHz format, before sample
     // conversion and resampling.
-    user_output_buffers: Vec<[f32; CPAL_BUFFER_SIZE]>,
+    user_output_buffers: Vec<[f32; USER_BUFFER_SIZE]>,
 }
 
 impl AudioSystem {
@@ -347,7 +348,7 @@ impl AudioSystem {
 
 // Given audio on all input channels, write the resulting audio to the output channels.
 // For now it does a simple loopback.
-fn big_mix(inputs: &[[f32; CPAL_BUFFER_SIZE]], outputs: &mut [[f32; CPAL_BUFFER_SIZE]]) {
+fn big_mix(inputs: &[[f32; USER_BUFFER_SIZE]], outputs: &mut [[f32; USER_BUFFER_SIZE]]) {
     for input_channel in inputs {
         for output_channel in &mut *outputs {
             output_channel.copy_from_slice(input_channel);
@@ -496,7 +497,7 @@ fn build_input_resampler(sample_rate: usize, num_channels: usize) -> SincFixedOu
         interpolation: SincInterpolationType::Cubic,
         window: WindowFunction::Blackman,
     };
-    let chunk_size = CPAL_BUFFER_SIZE;
+    let chunk_size = USER_BUFFER_SIZE;
 
     SincFixedOut::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
         .expect("Should be able to construct the resampler")
@@ -512,7 +513,7 @@ fn build_output_resampler(sample_rate: usize, num_channels: usize) -> SincFixedI
         interpolation: SincInterpolationType::Cubic,
         window: WindowFunction::Blackman,
     };
-    let chunk_size = CPAL_BUFFER_SIZE;
+    let chunk_size = USER_BUFFER_SIZE;
 
     SincFixedIn::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
         .expect("Should be able to construct the resampler")
