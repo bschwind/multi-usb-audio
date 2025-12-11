@@ -39,8 +39,8 @@ fn main() -> Result<()> {
     let mut user_output_buffers = vec![];
     let mut output_buffer_index_start = 0;
 
-    let target_input_device = "Blue Snowball";
-    let target_output_device = "Mac mini Speakers";
+    let target_input_device = ["Blue Snowball"];
+    let target_output_device = ["Mac mini Speakers"];
 
     for device in devices {
         let device_name = device.name()?;
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
         dbg!(device.supports_input());
         dbg!(device.supports_output());
 
-        if device.supports_input() && device_name == target_input_device {
+        if device.supports_input() && target_input_device.contains(&device_name.as_str()) {
             let device_config = device.default_input_config()?;
 
             let timeout = None;
@@ -146,7 +146,7 @@ fn main() -> Result<()> {
             input_streams.push(input_stream);
         }
 
-        if device.supports_output() && device_name == target_output_device {
+        if device.supports_output() && target_output_device.contains(&device_name.as_str()) {
             let device_config = device.default_output_config()?;
 
             let output_format = device_config.sample_format();
