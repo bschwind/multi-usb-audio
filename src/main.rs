@@ -349,7 +349,7 @@ impl AudioSystem {
                         Ok((_input_frames, output_frames)) => {
                             // Interleave the output channels for this device into the output stream's ring buffer.
                             for sample_idx in 0..output_frames {
-                                for out_channel in &self.user_output_buffers {
+                                for out_channel in &output_stream.resampler.output_buffer {
                                     let _ =
                                         output_stream.sample_tx.try_push(out_channel[sample_idx]);
                                 }
