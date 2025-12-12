@@ -403,6 +403,7 @@ impl InputStreamCallback {
         T: Sample,
         f32: cpal::FromSample<T>,
     {
+        let mut did_overrun = false;
         // dbg!(input.len());
         self.frame_count.fetch_add((input.len() / self.num_channels) as u64, Ordering::Relaxed);
 
@@ -410,7 +411,12 @@ impl InputStreamCallback {
             let float_sample = sample.to_sample::<f32>();
             if let Err(_e) = self.sample_tx.try_push(float_sample) {
                 // println!("Error on input stream: {e:?}");
+                did_overrun = true;
             }
+        }
+
+        if did_overrun {
+            // println!("overrun");
         }
     }
 }
@@ -479,7 +485,7 @@ impl OutputStreamCallback {
         }
 
         if did_underrun {
-            println!("underrun");
+            // println!("underrun");
         }
     }
 }
