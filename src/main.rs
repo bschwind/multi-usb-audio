@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+const NOMINAL_SAMPLE_RATE: u32 = 48000;
 const CPAL_BUFFER_SIZE: usize = 128;
 const USER_BUFFER_SIZE: usize = 480;
 const ERROR_BUFFER_SIZE: usize = 10;
@@ -55,11 +56,10 @@ fn main() -> Result<()> {
             let input_format = device_config.sample_format();
             let mut stream_config: StreamConfig = device_config.into();
 
-            dbg!(&stream_config);
-
             stream_config.channels = 1;
-            // stream_config.sample_rate = cpal::SampleRate(44100);
             stream_config.buffer_size = BufferSize::Fixed(CPAL_BUFFER_SIZE as u32);
+
+            dbg!(&stream_config);
 
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
@@ -128,20 +128,21 @@ fn main() -> Result<()> {
             }
 
             let input_stream = InputStream {
-                device_name: device_name.clone(),
-                num_channels: stream_config.channels as usize,
-                sample_rate: stream_config.sample_rate.0 as usize,
-                stream,
+                stream_common: StreamCommon {
+                    device_name: device_name.clone(),
+                    num_channels: stream_config.channels as usize,
+                    sample_rate: stream_config.sample_rate.0 as usize,
+                    stream,
+                    error_rx,
+                    total_frames: frame_count,
+                    last_frames: 0,
+                    has_errored: false,
+                    measured_sample_rate: stream_config.sample_rate.0 as f64,
+                    last_sample_rate_calc_time: Instant::now(),
+                },
                 sample_rx,
-                error_rx,
                 resampler: InputResampler::new(resampler),
-                total_frames: frame_count,
-                last_frames: 0,
-                has_errored: false,
                 input_buffer_index_start,
-                measured_sample_rate: stream_config.sample_rate.0 as f64,
-                last_sample_rate_calc_time: Instant::now(),
-                is_leader: false,
             };
 
             input_buffer_index_start += stream_config.channels as usize;
@@ -163,8 +164,11 @@ fn main() -> Result<()> {
             let frame_count = Arc::new(AtomicU64::new(0));
             let num_channels = stream_config.channels as usize;
 
-            let ring_buf = HeapRb::new((USER_BUFFER_SIZE * num_channels) * 4);
-            let (sample_tx, sample_rx) = ring_buf.split();
+            let sample_ring_buf = HeapRb::new((USER_BUFFER_SIZE * num_channels) * 4);
+            let (sample_tx, sample_rx) = sample_ring_buf.split();
+
+            let error_ring_buf = HeapRb::new(ERROR_BUFFER_SIZE);
+            let (mut error_tx, error_rx) = error_ring_buf.split();
 
             let mut stream_callback = OutputStreamCallback {
                 num_channels,
@@ -178,7 +182,9 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<i8>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 cpal::SampleFormat::I16 => device.build_output_stream(
@@ -186,7 +192,9 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<i16>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 cpal::SampleFormat::I32 => device.build_output_stream(
@@ -194,7 +202,9 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<i32>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 cpal::SampleFormat::F32 => device.build_output_stream(
@@ -202,7 +212,9 @@ fn main() -> Result<()> {
                     move |data, callback_info| {
                         stream_callback.process::<f32>(data, callback_info);
                     },
-                    |_| {},
+                    move |err| {
+                        error_tx.try_push(err).expect("Error ring buffer shouldn't be full");
+                    },
                     timeout,
                 ),
                 _ => panic!("oh no"),
@@ -216,18 +228,21 @@ fn main() -> Result<()> {
             }
 
             let output_stream = OutputStream {
-                device_name: device_name.clone(),
-                num_channels: stream_config.channels as usize,
-                sample_rate: stream_config.sample_rate.0 as usize,
-                stream,
+                stream_common: StreamCommon {
+                    device_name: device_name.clone(),
+                    num_channels: stream_config.channels as usize,
+                    sample_rate: stream_config.sample_rate.0 as usize,
+                    stream,
+                    error_rx,
+                    total_frames: frame_count,
+                    last_frames: 0,
+                    has_errored: false,
+                    measured_sample_rate: stream_config.sample_rate.0 as f64,
+                    last_sample_rate_calc_time: Instant::now(),
+                },
                 sample_tx,
                 resampler: OutputResampler::new(resampler),
-                total_frames: frame_count,
-                last_frames: 0,
                 output_buffer_index_start,
-                measured_sample_rate: stream_config.sample_rate.0 as f64,
-                last_sample_rate_calc_time: Instant::now(),
-                is_leader: false,
             };
 
             output_buffer_index_start += stream_config.channels as usize;
@@ -235,8 +250,6 @@ fn main() -> Result<()> {
             output_streams.push(output_stream);
         }
     }
-
-    input_streams[0].is_leader = true;
 
     let mut audio_system =
         AudioSystem { input_streams, output_streams, user_input_buffers, user_output_buffers };
@@ -300,7 +313,7 @@ impl AudioSystem {
                     should_output = true;
                     deinterleave_from_ring_buf(
                         input_stream.sample_rx.pop_iter(),
-                        input_stream.num_channels,
+                        input_stream.stream_common.num_channels,
                         input_frames_needed,
                         &mut input_stream.resampler.input_buffer,
                     );
@@ -373,24 +386,20 @@ fn big_mix(inputs: &[[f32; USER_BUFFER_SIZE]], outputs: &mut [[f32; USER_BUFFER_
     }
 }
 
-pub struct InputStream {
+pub struct StreamCommon {
     device_name: String,
     num_channels: usize,
     sample_rate: usize,
     stream: cpal::Stream,
-    sample_rx: RingBufferRx<f32>,
     error_rx: RingBufferRx<StreamError>,
-    resampler: InputResampler,
     total_frames: Arc<AtomicU64>,
     last_frames: u64,
     has_errored: bool,
-    input_buffer_index_start: usize,
     measured_sample_rate: f64,
     last_sample_rate_calc_time: Instant,
-    is_leader: bool,
 }
 
-impl InputStream {
+impl StreamCommon {
     fn recalculate_sample_rate(&mut self) {
         let total_frames = self.total_frames.load(Ordering::Relaxed);
         let diff = total_frames - self.last_frames;
@@ -403,6 +412,27 @@ impl InputStream {
 
         self.last_frames = total_frames;
         self.last_sample_rate_calc_time = Instant::now();
+    }
+}
+
+pub struct InputStream {
+    stream_common: StreamCommon,
+    sample_rx: RingBufferRx<f32>,
+    resampler: InputResampler,
+    input_buffer_index_start: usize,
+}
+
+impl std::ops::Deref for InputStream {
+    type Target = StreamCommon;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream_common
+    }
+}
+
+impl std::ops::DerefMut for InputStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream_common
     }
 }
 
@@ -419,13 +449,11 @@ impl InputStreamCallback {
         f32: cpal::FromSample<T>,
     {
         let mut did_overrun = false;
-        // dbg!(input.len());
         self.frame_count.fetch_add((input.len() / self.num_channels) as u64, Ordering::Relaxed);
 
         for sample in input {
             let float_sample = sample.to_sample::<f32>();
             if let Err(_e) = self.sample_tx.try_push(float_sample) {
-                // println!("Error on input stream: {e:?}");
                 did_overrun = true;
             }
         }
@@ -465,33 +493,23 @@ impl OutputResampler {
 }
 
 pub struct OutputStream {
-    device_name: String,
-    num_channels: usize,
-    sample_rate: usize,
-    stream: cpal::Stream,
+    stream_common: StreamCommon,
     sample_tx: RingBufferTx<f32>,
     resampler: OutputResampler,
-    total_frames: Arc<AtomicU64>,
-    last_frames: u64,
     output_buffer_index_start: usize,
-    measured_sample_rate: f64,
-    last_sample_rate_calc_time: Instant,
-    is_leader: bool,
 }
 
-impl OutputStream {
-    fn recalculate_sample_rate(&mut self) {
-        let total_frames = self.total_frames.load(Ordering::Relaxed);
-        let diff = total_frames - self.last_frames;
-        println!("Stream '{}' frames: {} (+{})", self.device_name, total_frames, diff);
+impl std::ops::Deref for OutputStream {
+    type Target = StreamCommon;
 
-        let new_measured_sample_rate =
-            diff as f64 / self.last_sample_rate_calc_time.elapsed().as_secs_f64();
-        self.measured_sample_rate = (new_measured_sample_rate + self.measured_sample_rate) * 0.5;
-        dbg!(self.measured_sample_rate);
+    fn deref(&self) -> &Self::Target {
+        &self.stream_common
+    }
+}
 
-        self.last_frames = total_frames;
-        self.last_sample_rate_calc_time = Instant::now();
+impl std::ops::DerefMut for OutputStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream_common
     }
 }
 
@@ -524,33 +542,13 @@ impl OutputStreamCallback {
     }
 }
 
-fn deinterleave_into<T: AsMut<[f32]>>(data: &[f32], num_channels: usize, output: &mut [T]) {
-    assert!(data.len().is_multiple_of(num_channels));
-    assert_eq!(output.len(), num_channels);
-    for buf in output.iter_mut() {
-        assert_eq!(buf.as_mut().len(), data.len() / num_channels);
-    }
-
-    for (channel_index, channel) in output.iter_mut().enumerate() {
-        for (sample, multi_sample) in
-            channel.as_mut().iter_mut().zip(data.chunks_exact(num_channels))
-        {
-            *sample = multi_sample[channel_index];
-        }
-    }
-}
-
 fn deinterleave_from_ring_buf<T: AsMut<[f32]>>(
     mut pop_iter: PopIter<RingBufferRx<f32>>,
     num_channels: usize,
     frames_needed: usize,
     output: &mut [T],
 ) {
-    // assert!(pop_iter.len().is_multiple_of(num_channels));
     assert_eq!(output.len(), num_channels);
-    // for buf in output.iter_mut() {
-    //     assert_eq!(buf.as_mut().len(), pop_iter.len() / num_channels);
-    // }
 
     for i in 0..frames_needed {
         for channel in output.iter_mut() {
@@ -562,7 +560,7 @@ fn deinterleave_from_ring_buf<T: AsMut<[f32]>>(
 }
 
 fn build_input_resampler(sample_rate: usize, num_channels: usize) -> SincFixedOut<f32> {
-    let resample_ratio = 48_000.0f64 / sample_rate as f64;
+    let resample_ratio = NOMINAL_SAMPLE_RATE as f64 / sample_rate as f64;
     let max_relative_resample_ratio = 1.1;
     let params = SincInterpolationParameters {
         sinc_len: 256,
@@ -578,7 +576,7 @@ fn build_input_resampler(sample_rate: usize, num_channels: usize) -> SincFixedOu
 }
 
 fn build_output_resampler(sample_rate: usize, num_channels: usize) -> SincFixedIn<f32> {
-    let resample_ratio = sample_rate as f64 / 48_000.0f64;
+    let resample_ratio = sample_rate as f64 / NOMINAL_SAMPLE_RATE as f64;
     let max_relative_resample_ratio = 1.1;
     let params = SincInterpolationParameters {
         sinc_len: 256,
