@@ -139,6 +139,9 @@ fn main() -> Result<()> {
                 last_frames: 0,
                 has_errored: false,
                 input_buffer_index_start,
+                measured_sample_rate: stream_config.sample_rate.0 as f64,
+                last_sample_rate_calc_time: Instant::now(),
+                is_leader: false,
             };
 
             input_buffer_index_start += stream_config.channels as usize;
@@ -222,6 +225,9 @@ fn main() -> Result<()> {
                 total_frames: frame_count,
                 last_frames: 0,
                 output_buffer_index_start,
+                measured_sample_rate: stream_config.sample_rate.0 as f64,
+                last_sample_rate_calc_time: Instant::now(),
+                is_leader: false,
             };
 
             output_buffer_index_start += stream_config.channels as usize;
@@ -229,6 +235,8 @@ fn main() -> Result<()> {
             output_streams.push(output_stream);
         }
     }
+
+    input_streams[0].is_leader = true;
 
     let mut audio_system =
         AudioSystem { input_streams, output_streams, user_input_buffers, user_output_buffers };
@@ -251,7 +259,7 @@ pub struct AudioSystem {
 impl AudioSystem {
     pub fn run(&mut self) {
         let now = Instant::now();
-        let mut last_print = now;
+        let mut last_rate_recalculate = now;
 
         dbg!(self.user_input_buffers.len());
         dbg!(self.user_output_buffers.len());
@@ -266,30 +274,16 @@ impl AudioSystem {
                 }
             }
 
-            if last_print.elapsed() >= Duration::from_secs(1) {
+            if last_rate_recalculate.elapsed() >= Duration::from_secs(4) {
                 for stream in &mut self.input_streams {
-                    let total_frames = stream.total_frames.load(Ordering::Relaxed);
-                    let diff = total_frames - stream.last_frames;
-                    println!(
-                        "Stream '{}' frames: {} (+{})",
-                        stream.device_name, total_frames, diff
-                    );
-
-                    stream.last_frames = total_frames;
+                    stream.recalculate_sample_rate();
                 }
 
                 for stream in &mut self.output_streams {
-                    let total_frames = stream.total_frames.load(Ordering::Relaxed);
-                    let diff = total_frames - stream.last_frames;
-                    println!(
-                        "Stream '{}' frames: {} (+{})",
-                        stream.device_name, total_frames, diff
-                    );
-
-                    stream.last_frames = total_frames;
+                    stream.recalculate_sample_rate();
                 }
 
-                last_print = Instant::now();
+                last_rate_recalculate = Instant::now();
             }
 
             let mut should_output = false;
@@ -362,6 +356,8 @@ impl AudioSystem {
                 }
             }
 
+            // TODO(bschwind) - Find a way to drive this loop in a more efficient manner without using sleep.
+            //                  Maybe CondVars, or OS-specific wakeup events like eventfd or kqueue?
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -389,6 +385,25 @@ pub struct InputStream {
     last_frames: u64,
     has_errored: bool,
     input_buffer_index_start: usize,
+    measured_sample_rate: f64,
+    last_sample_rate_calc_time: Instant,
+    is_leader: bool,
+}
+
+impl InputStream {
+    fn recalculate_sample_rate(&mut self) {
+        let total_frames = self.total_frames.load(Ordering::Relaxed);
+        let diff = total_frames - self.last_frames;
+        println!("Stream '{}' frames: {} (+{})", self.device_name, total_frames, diff);
+
+        let new_measured_sample_rate =
+            diff as f64 / self.last_sample_rate_calc_time.elapsed().as_secs_f64();
+        self.measured_sample_rate = (new_measured_sample_rate + self.measured_sample_rate) * 0.5;
+        dbg!(self.measured_sample_rate);
+
+        self.last_frames = total_frames;
+        self.last_sample_rate_calc_time = Instant::now();
+    }
 }
 
 pub struct InputStreamCallback {
@@ -459,6 +474,25 @@ pub struct OutputStream {
     total_frames: Arc<AtomicU64>,
     last_frames: u64,
     output_buffer_index_start: usize,
+    measured_sample_rate: f64,
+    last_sample_rate_calc_time: Instant,
+    is_leader: bool,
+}
+
+impl OutputStream {
+    fn recalculate_sample_rate(&mut self) {
+        let total_frames = self.total_frames.load(Ordering::Relaxed);
+        let diff = total_frames - self.last_frames;
+        println!("Stream '{}' frames: {} (+{})", self.device_name, total_frames, diff);
+
+        let new_measured_sample_rate =
+            diff as f64 / self.last_sample_rate_calc_time.elapsed().as_secs_f64();
+        self.measured_sample_rate = (new_measured_sample_rate + self.measured_sample_rate) * 0.5;
+        dbg!(self.measured_sample_rate);
+
+        self.last_frames = total_frames;
+        self.last_sample_rate_calc_time = Instant::now();
+    }
 }
 
 pub struct OutputStreamCallback {
