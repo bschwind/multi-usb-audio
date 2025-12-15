@@ -413,9 +413,9 @@ impl InputStream {
                 user_input_buffer,
                 None,
             ) {
-                Ok((_input_frames, _output_frames)) => {
+                Ok((input_frames, _output_frames)) => {
                     // user_input_buffer is now ready for this stream
-                    // TODO(bschwind) - Assert `input_frames` is the same as `input_frames_needed`.
+                    assert_eq!(input_frames_needed, input_frames);
                     true
                 },
                 Err(e) => {
