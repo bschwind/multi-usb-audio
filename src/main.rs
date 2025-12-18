@@ -13,6 +13,7 @@ use rubato::{
     WindowFunction,
 };
 use std::{
+    f64::consts::PI,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -70,15 +71,17 @@ fn main() -> Result<()> {
             let error_ring_buf = HeapRb::new(ERROR_BUFFER_SIZE);
             let (mut error_tx, error_rx) = error_ring_buf.split();
 
-            // let stream_start = Instant::now();
-            // let period_time = Duration::from_secs_f64(CPAL_BUFFER_SIZE as f64 / NOMINAL_SAMPLE_RATE as f64);
+            let stream_start = Instant::now();
+            let period_time =
+                Duration::from_secs_f64(CPAL_BUFFER_SIZE as f64 / NOMINAL_SAMPLE_RATE as f64);
 
             let mut stream_callback = InputStreamCallback {
                 num_channels,
                 sample_tx,
                 frame_count: Arc::clone(&frame_count),
-                stream_start: None,
-                next_callback: None,
+                stream_start,
+                next_callback: stream_start + period_time,
+                delay_locked_loop: DelayLockedLoop::new(CPAL_BUFFER_SIZE as u64, stream_start),
             };
 
             let stream = match input_format {
@@ -434,39 +437,105 @@ impl InputStream {
     }
 }
 
+struct DelayLockedLoop {
+    error_accum: f64,
+    time: Instant,
+    time_next: Instant,
+    sample_count: u64,
+    sample_count_next: u64,
+}
+
+// Reference: https://kokkinizita.linuxaudio.org/papers/usingdll.pdf
+impl DelayLockedLoop {
+    fn new(period_size_frames: u64, now: Instant) -> Self {
+        let period_time_secs = period_size_frames as f64 / NOMINAL_SAMPLE_RATE as f64;
+
+        let period_time = Duration::from_secs_f64(period_time_secs);
+
+        Self {
+            error_accum: period_time_secs,
+            time: now,
+            time_next: now + period_time,
+            sample_count: 0,
+            sample_count_next: period_size_frames,
+        }
+    }
+
+    fn update(&mut self, now: Instant, num_frames: u64) -> f64 {
+        // TODO(bschwind) - Set these in the constructor.
+        let filter_bandwidth = 2.0;
+        let sample_frequency = NOMINAL_SAMPLE_RATE as f64 / num_frames as f64;
+
+        // TODO(bschwind) - Cache these.
+        let w = (2.0 * PI * filter_bandwidth) / sample_frequency;
+        let b = 2.0_f64.sqrt() * w;
+        let c = w * w;
+
+        let (error, is_positive) = if now > self.time_next {
+            (now - self.time_next, true)
+        } else {
+            (self.time_next - now, false)
+        };
+
+        let error_secs = error.as_secs_f64() * if is_positive { 1.0 } else { -1.0 };
+
+        self.time = self.time_next;
+
+        let x = b * error_secs + self.error_accum;
+        let next_time_adjustment = Duration::from_secs_f64(x.abs());
+        if x >= 0.0 {
+            self.time_next += next_time_adjustment;
+        } else {
+            self.time_next -= next_time_adjustment;
+        }
+
+        self.error_accum += c * error_secs;
+
+        self.sample_count = self.sample_count_next;
+        self.sample_count_next += num_frames;
+
+        error_secs
+    }
+
+    fn next_capture_time(&self) -> Instant {
+        self.time_next
+    }
+}
+
 pub struct InputStreamCallback {
     num_channels: usize,
     sample_tx: RingBufferTx<f32>,
     frame_count: Arc<AtomicU64>,
-    stream_start: Option<cpal::StreamInstant>,
-    next_callback: Option<cpal::StreamInstant>,
+    stream_start: Instant,
+    next_callback: Instant,
+    delay_locked_loop: DelayLockedLoop,
 }
 
 impl InputStreamCallback {
-    pub fn process<T>(&mut self, input: &[T], callback_info: &InputCallbackInfo)
+    pub fn process<T>(&mut self, input: &[T], _callback_info: &InputCallbackInfo)
     where
         T: Sample,
         f32: cpal::FromSample<T>,
     {
-        let period_time = Duration::from_secs_f64(
-            (input.len() / self.num_channels) as f64 / NOMINAL_SAMPLE_RATE as f64,
-        );
-        let capture_time = callback_info.timestamp().capture;
+        let num_frames = input.len() / self.num_channels;
 
-        if self.stream_start.is_none() {
-            self.stream_start = Some(capture_time);
+        let period_time = Duration::from_secs_f64(num_frames as f64 / NOMINAL_SAMPLE_RATE as f64);
+        let capture_time = Instant::now();
+        // println!("This capture time: {:?}", capture_time - self.stream_start);
+
+        let _error_secs = self.delay_locked_loop.update(capture_time, num_frames as u64);
+
+        let predicted_capture_time = self.next_callback;
+        let _error = if capture_time > predicted_capture_time {
+            capture_time - predicted_capture_time
         } else {
-            let predicted_capture_time = self.next_callback.unwrap();
-            let error = if capture_time > predicted_capture_time {
-                capture_time.duration_since(&predicted_capture_time).unwrap()
-            } else {
-                predicted_capture_time.duration_since(&capture_time).unwrap()
-            };
+            predicted_capture_time - capture_time
+        };
 
-            println!("{}, {:?}", self.frame_count.load(Ordering::Relaxed), error);
-        }
+        // let _next_capture_time = self.delay_locked_loop.next_capture_time();
+        // println!("Next capture time: {:?}", next_capture_time - self.stream_start);
 
-        self.next_callback = Some(capture_time.add(period_time).unwrap());
+        self.next_callback = capture_time + period_time;
 
         let mut did_overrun = false;
         self.frame_count.fetch_add((input.len() / self.num_channels) as u64, Ordering::Relaxed);
