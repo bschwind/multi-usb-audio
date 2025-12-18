@@ -72,16 +72,13 @@ fn main() -> Result<()> {
             let (mut error_tx, error_rx) = error_ring_buf.split();
 
             let stream_start = Instant::now();
-            let period_time =
-                Duration::from_secs_f64(CPAL_BUFFER_SIZE as f64 / NOMINAL_SAMPLE_RATE as f64);
 
             let mut stream_callback = InputStreamCallback {
                 num_channels,
                 sample_tx,
                 frame_count: Arc::clone(&frame_count),
                 stream_start,
-                next_callback: stream_start + period_time,
-                delay_locked_loop: DelayLockedLoop::new(CPAL_BUFFER_SIZE as u64, stream_start),
+                delay_locked_loop: None,
             };
 
             let stream = match input_format {
@@ -507,8 +504,7 @@ pub struct InputStreamCallback {
     sample_tx: RingBufferTx<f32>,
     frame_count: Arc<AtomicU64>,
     stream_start: Instant,
-    next_callback: Instant,
-    delay_locked_loop: DelayLockedLoop,
+    delay_locked_loop: Option<DelayLockedLoop>,
 }
 
 impl InputStreamCallback {
@@ -517,25 +513,16 @@ impl InputStreamCallback {
         T: Sample,
         f32: cpal::FromSample<T>,
     {
+        let capture_time = Instant::now();
         let num_frames = input.len() / self.num_channels;
 
-        let period_time = Duration::from_secs_f64(num_frames as f64 / NOMINAL_SAMPLE_RATE as f64);
-        let capture_time = Instant::now();
-        // println!("This capture time: {:?}", capture_time - self.stream_start);
-
-        let _error_secs = self.delay_locked_loop.update(capture_time, num_frames as u64);
-
-        let predicted_capture_time = self.next_callback;
-        let _error = if capture_time > predicted_capture_time {
-            capture_time - predicted_capture_time
+        if self.delay_locked_loop.is_none() {
+            self.delay_locked_loop = Some(DelayLockedLoop::new(num_frames as u64, capture_time));
         } else {
-            predicted_capture_time - capture_time
-        };
-
-        // let _next_capture_time = self.delay_locked_loop.next_capture_time();
-        // println!("Next capture time: {:?}", next_capture_time - self.stream_start);
-
-        self.next_callback = capture_time + period_time;
+            let error_secs =
+                self.delay_locked_loop.as_mut().unwrap().update(capture_time, num_frames as u64);
+            println!("{:?}", Duration::from_secs_f64(error_secs.abs()));
+        }
 
         let mut did_overrun = false;
         self.frame_count.fetch_add((input.len() / self.num_channels) as u64, Ordering::Relaxed);
