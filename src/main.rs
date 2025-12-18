@@ -70,10 +70,15 @@ fn main() -> Result<()> {
             let error_ring_buf = HeapRb::new(ERROR_BUFFER_SIZE);
             let (mut error_tx, error_rx) = error_ring_buf.split();
 
+            // let stream_start = Instant::now();
+            // let period_time = Duration::from_secs_f64(CPAL_BUFFER_SIZE as f64 / NOMINAL_SAMPLE_RATE as f64);
+
             let mut stream_callback = InputStreamCallback {
                 num_channels,
                 sample_tx,
                 frame_count: Arc::clone(&frame_count),
+                stream_start: None,
+                next_callback: None,
             };
 
             let stream = match input_format {
@@ -433,14 +438,36 @@ pub struct InputStreamCallback {
     num_channels: usize,
     sample_tx: RingBufferTx<f32>,
     frame_count: Arc<AtomicU64>,
+    stream_start: Option<cpal::StreamInstant>,
+    next_callback: Option<cpal::StreamInstant>,
 }
 
 impl InputStreamCallback {
-    pub fn process<T>(&mut self, input: &[T], _callback_info: &InputCallbackInfo)
+    pub fn process<T>(&mut self, input: &[T], callback_info: &InputCallbackInfo)
     where
         T: Sample,
         f32: cpal::FromSample<T>,
     {
+        let period_time = Duration::from_secs_f64(
+            (input.len() / self.num_channels) as f64 / NOMINAL_SAMPLE_RATE as f64,
+        );
+        let capture_time = callback_info.timestamp().capture;
+
+        if self.stream_start.is_none() {
+            self.stream_start = Some(capture_time);
+        } else {
+            let predicted_capture_time = self.next_callback.unwrap();
+            let error = if capture_time > predicted_capture_time {
+                capture_time.duration_since(&predicted_capture_time).unwrap()
+            } else {
+                predicted_capture_time.duration_since(&capture_time).unwrap()
+            };
+
+            println!("{}, {:?}", self.frame_count.load(Ordering::Relaxed), error);
+        }
+
+        self.next_callback = Some(capture_time.add(period_time).unwrap());
+
         let mut did_overrun = false;
         self.frame_count.fetch_add((input.len() / self.num_channels) as u64, Ordering::Relaxed);
 
