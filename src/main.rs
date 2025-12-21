@@ -45,12 +45,16 @@ fn main() -> Result<()> {
     let target_output_device = ["Mac mini Speakers"];
 
     for device in devices {
-        let device_name = device.name()?;
-        dbg!(&device_name);
+        let description = device.description()?;
+        let device_name = description.name();
+
+        println!();
+        dbg!(device_name);
+        dbg!(device.id()?.to_string());
         dbg!(device.supports_input());
         dbg!(device.supports_output());
 
-        if device.supports_input() && target_input_device.contains(&device_name.as_str()) {
+        if device.supports_input() && target_input_device.contains(&device_name) {
             let device_config = device.default_input_config()?;
 
             let timeout = None;
@@ -125,8 +129,7 @@ fn main() -> Result<()> {
                 _ => panic!("oh no"),
             }?;
 
-            let resampler =
-                build_input_resampler(stream_config.sample_rate.0 as usize, num_channels);
+            let resampler = build_input_resampler(stream_config.sample_rate as usize, num_channels);
 
             for _ in 0..num_channels {
                 user_input_buffers.push([0.0f32; USER_BUFFER_SIZE]);
@@ -134,15 +137,15 @@ fn main() -> Result<()> {
 
             let input_stream = InputStream {
                 stream_common: StreamCommon {
-                    device_name: device_name.clone(),
+                    device_name: device_name.to_string(),
                     num_channels: stream_config.channels as usize,
-                    sample_rate: stream_config.sample_rate.0 as usize,
+                    sample_rate: stream_config.sample_rate as usize,
                     stream,
                     error_rx,
                     total_frames: frame_count,
                     last_frames: 0,
                     has_errored: false,
-                    measured_sample_rate: stream_config.sample_rate.0 as f64,
+                    measured_sample_rate: stream_config.sample_rate as f64,
                     last_sample_rate_calc_time: Instant::now(),
                 },
                 sample_rx,
@@ -155,7 +158,7 @@ fn main() -> Result<()> {
             input_streams.push(input_stream);
         }
 
-        if device.supports_output() && target_output_device.contains(&device_name.as_str()) {
+        if device.supports_output() && target_output_device.contains(&device_name) {
             let device_config = device.default_output_config()?;
 
             let output_format = device_config.sample_format();
@@ -227,7 +230,7 @@ fn main() -> Result<()> {
             }?;
 
             let resampler =
-                build_output_resampler(stream_config.sample_rate.0 as usize, num_channels);
+                build_output_resampler(stream_config.sample_rate as usize, num_channels);
 
             for _ in 0..num_channels {
                 user_output_buffers.push([0.0f32; USER_BUFFER_SIZE]);
@@ -235,15 +238,15 @@ fn main() -> Result<()> {
 
             let output_stream = OutputStream {
                 stream_common: StreamCommon {
-                    device_name: device_name.clone(),
+                    device_name: device_name.to_string(),
                     num_channels: stream_config.channels as usize,
-                    sample_rate: stream_config.sample_rate.0 as usize,
+                    sample_rate: stream_config.sample_rate as usize,
                     stream,
                     error_rx,
                     total_frames: frame_count,
                     last_frames: 0,
                     has_errored: false,
-                    measured_sample_rate: stream_config.sample_rate.0 as f64,
+                    measured_sample_rate: stream_config.sample_rate as f64,
                     last_sample_rate_calc_time: Instant::now(),
                 },
                 sample_tx,
