@@ -438,6 +438,9 @@ impl InputStream {
 }
 
 struct DelayLockedLoop {
+    omega: f64,
+    b: f64,
+    c: f64,
     error_accum: f64,
     time: Instant,
     time_next: Instant,
@@ -449,10 +452,18 @@ struct DelayLockedLoop {
 impl DelayLockedLoop {
     fn new(period_size_frames: u64, now: Instant) -> Self {
         let period_time_secs = period_size_frames as f64 / NOMINAL_SAMPLE_RATE as f64;
-
         let period_time = Duration::from_secs_f64(period_time_secs);
 
+        let filter_bandwidth = 0.2;
+        let sample_frequency = NOMINAL_SAMPLE_RATE as f64 / period_size_frames as f64;
+        let omega = (2.0 * PI * filter_bandwidth) / sample_frequency;
+        let b = 2.0_f64.sqrt() * omega;
+        let c = omega * omega;
+
         Self {
+            omega,
+            b,
+            c,
             error_accum: period_time_secs,
             time: now,
             time_next: now + period_time,
@@ -462,15 +473,6 @@ impl DelayLockedLoop {
     }
 
     fn update(&mut self, now: Instant, num_frames: u64) -> f64 {
-        // TODO(bschwind) - Set these in the constructor.
-        let filter_bandwidth = 2.0;
-        let sample_frequency = NOMINAL_SAMPLE_RATE as f64 / num_frames as f64;
-
-        // TODO(bschwind) - Cache these.
-        let w = (2.0 * PI * filter_bandwidth) / sample_frequency;
-        let b = 2.0_f64.sqrt() * w;
-        let c = w * w;
-
         let (error, is_positive) = if now > self.time_next {
             (now - self.time_next, true)
         } else {
@@ -481,7 +483,7 @@ impl DelayLockedLoop {
 
         self.time = self.time_next;
 
-        let x = b * error_secs + self.error_accum;
+        let x = self.b * error_secs + self.error_accum;
         let next_time_adjustment = Duration::from_secs_f64(x.abs());
         if x >= 0.0 {
             self.time_next += next_time_adjustment;
@@ -489,7 +491,9 @@ impl DelayLockedLoop {
             self.time_next -= next_time_adjustment;
         }
 
-        self.error_accum += c * error_secs;
+        self.error_accum += self.c * error_secs;
+
+        println!("Estimated sample rate: {}", CPAL_BUFFER_SIZE as f64 / self.error_accum);
 
         self.sample_count = self.sample_count_next;
         self.sample_count_next += num_frames;
@@ -522,9 +526,9 @@ impl InputStreamCallback {
         if self.delay_locked_loop.is_none() {
             self.delay_locked_loop = Some(DelayLockedLoop::new(num_frames as u64, capture_time));
         } else {
-            let error_secs =
+            let _error_secs =
                 self.delay_locked_loop.as_mut().unwrap().update(capture_time, num_frames as u64);
-            println!("{:?}", Duration::from_secs_f64(error_secs.abs()));
+            // println!("{:?}", Duration::from_secs_f64(error_secs.abs()));
         }
 
         let mut did_overrun = false;
