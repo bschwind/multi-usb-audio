@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-cpal = "0.16"
+cpal = "0.17"
 ringbuf = "0.4"
 rubato = { version = "0.16", default-features = false }
