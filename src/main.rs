@@ -25,6 +25,7 @@ const NOMINAL_SAMPLE_RATE: u32 = 48000;
 const CPAL_BUFFER_SIZE: usize = 128;
 const USER_BUFFER_SIZE: usize = 480;
 const ERROR_BUFFER_SIZE: usize = 10;
+const TIMING_INFO_BUFFER_SIZE: usize = 100;
 
 type RingBufferTx<T> = CachingProd<Arc<HeapRb<T>>>;
 type RingBufferRx<T> = CachingCons<Arc<HeapRb<T>>>;
@@ -41,8 +42,8 @@ fn main() -> Result<()> {
     let mut user_output_buffers = vec![];
     let mut output_buffer_index_start = 0;
 
-    let target_input_device = ["Blue Snowball"];
-    let target_output_device = ["Mac mini Speakers"];
+    let target_input_device = ["MacBook Pro Microphone"];
+    let target_output_device = ["MacBook Pro Speakers"];
 
     for device in devices {
         let description = device.description()?;
@@ -75,11 +76,15 @@ fn main() -> Result<()> {
             let error_ring_buf = HeapRb::new(ERROR_BUFFER_SIZE);
             let (mut error_tx, error_rx) = error_ring_buf.split();
 
+            let timing_info_ring_buf = HeapRb::new(TIMING_INFO_BUFFER_SIZE);
+            let (mut timing_info_tx, timing_info_rx) = timing_info_ring_buf.split();
+
             let stream_start = Instant::now();
 
             let mut stream_callback = InputStreamCallback {
                 num_channels,
                 sample_tx,
+                timing_info_tx,
                 frame_count: Arc::clone(&frame_count),
                 stream_start,
                 delay_locked_loop: None,
@@ -149,8 +154,10 @@ fn main() -> Result<()> {
                     last_sample_rate_calc_time: Instant::now(),
                 },
                 sample_rx,
+                timing_info_rx,
                 resampler: InputResampler::new(resampler),
                 input_buffer_index_start,
+                timing_accum: None,
             };
 
             input_buffer_index_start += stream_config.channels as usize;
@@ -287,6 +294,8 @@ impl AudioSystem {
         dbg!(self.user_output_buffers.len());
 
         while now.elapsed() < Duration::from_secs(100) {
+            let loop_start = Instant::now();
+
             for stream in &mut self.input_streams {
                 if let Some(err) = stream.error_rx.try_pop() {
                     println!("Stream {} got error: {err:?}", stream.device_name);
@@ -294,10 +303,38 @@ impl AudioSystem {
                     // TODO(bschwind) - Mark the stream as disconnected, zero its buffers,
                     //                  and try to recreate it.
                 }
+
+                if let Some(timing_info) = stream.timing_info_rx.try_pop() {
+                    if let Some(timing_accum) = stream.timing_accum.as_mut() {
+                        let prev_frames = timing_accum.total_frames;
+                        let _prev_time = timing_accum.prev_callback_time;
+
+                        // A(t) = k0 + (k1 - k0) * (t - t0) / (t1 - t0)
+                        let timespan = (timing_info.next_callback_time
+                            - timing_accum.prev_callback_time)
+                            .as_secs_f64();
+                        let time_so_far =
+                            (loop_start - timing_accum.prev_callback_time).as_secs_f64();
+                        let interpolated_frames = 0.0 as f64
+                            + timing_info.frames_written as f64 * (time_so_far / timespan);
+                        // dbg!(interpolated_frames);
+
+                        // dbg!(prev_frames);
+
+                        timing_accum.total_frames += timing_info.frames_written as u64;
+                        timing_accum.prev_callback_time = timing_info.next_callback_time;
+                    } else {
+                        stream.timing_accum = Some(TimingAccum {
+                            total_frames: timing_info.frames_written as u64,
+                            prev_callback_time: timing_info.next_callback_time,
+                        });
+                    }
+                }
             }
 
             if last_rate_recalculate.elapsed() >= Duration::from_secs(4) {
                 for stream in &mut self.input_streams {
+                    dbg!(&stream.timing_accum);
                     stream.recalculate_sample_rate();
                 }
 
@@ -374,8 +411,16 @@ impl StreamCommon {
 pub struct InputStream {
     stream_common: StreamCommon,
     sample_rx: RingBufferRx<f32>,
+    timing_info_rx: RingBufferRx<TimingInfo>,
     resampler: InputResampler,
     input_buffer_index_start: usize,
+    timing_accum: Option<TimingAccum>,
+}
+
+#[derive(Debug)]
+struct TimingAccum {
+    total_frames: u64,
+    prev_callback_time: Instant,
 }
 
 impl std::ops::Deref for InputStream {
@@ -493,7 +538,7 @@ impl DelayLockedLoop {
 
         self.error_accum += self.c * error_secs;
 
-        println!("Estimated sample rate: {}", CPAL_BUFFER_SIZE as f64 / self.error_accum);
+        // println!("Estimated sample rate: {}", CPAL_BUFFER_SIZE as f64 / self.error_accum);
 
         self.sample_count = self.sample_count_next;
         self.sample_count_next += num_frames;
@@ -506,9 +551,16 @@ impl DelayLockedLoop {
     }
 }
 
+#[derive(Debug)]
+pub struct TimingInfo {
+    frames_written: usize,
+    next_callback_time: Instant,
+}
+
 pub struct InputStreamCallback {
     num_channels: usize,
     sample_tx: RingBufferTx<f32>,
+    timing_info_tx: RingBufferTx<TimingInfo>,
     frame_count: Arc<AtomicU64>,
     stream_start: Instant,
     delay_locked_loop: Option<DelayLockedLoop>,
@@ -543,6 +595,11 @@ impl InputStreamCallback {
 
         if did_overrun {
             // println!("overrun");
+        } else {
+            let next_callback_time = self.delay_locked_loop.as_ref().unwrap().next_capture_time();
+            self.timing_info_tx
+                .try_push(TimingInfo { frames_written: num_frames, next_callback_time })
+                .expect("Should be able to send timing info")
         }
     }
 }
