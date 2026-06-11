@@ -1,7 +1,7 @@
 use anyhow::Result;
 use cpal::{
-    BufferSize, InputCallbackInfo, OutputCallbackInfo, Sample, StreamConfig, StreamError,
-    traits::{DeviceTrait, HostTrait},
+    BufferSize, InputCallbackInfo, OutputCallbackInfo, Sample, StreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use ringbuf::{
     CachingCons, CachingProd, HeapRb,
@@ -92,7 +92,7 @@ fn main() -> Result<()> {
 
             let stream = match input_format {
                 cpal::SampleFormat::I8 => device.build_input_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<i8>(data, callback_info);
                     },
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
                     timeout,
                 ),
                 cpal::SampleFormat::I16 => device.build_input_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<i16>(data, callback_info);
                     },
@@ -112,7 +112,7 @@ fn main() -> Result<()> {
                     timeout,
                 ),
                 cpal::SampleFormat::I32 => device.build_input_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<i32>(data, callback_info);
                     },
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
                     timeout,
                 ),
                 cpal::SampleFormat::F32 => device.build_input_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<f32>(data, callback_info);
                     },
@@ -194,7 +194,7 @@ fn main() -> Result<()> {
 
             let stream = match output_format {
                 cpal::SampleFormat::I8 => device.build_output_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<i8>(data, callback_info);
                     },
@@ -204,7 +204,7 @@ fn main() -> Result<()> {
                     timeout,
                 ),
                 cpal::SampleFormat::I16 => device.build_output_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<i16>(data, callback_info);
                     },
@@ -214,7 +214,7 @@ fn main() -> Result<()> {
                     timeout,
                 ),
                 cpal::SampleFormat::I32 => device.build_output_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<i32>(data, callback_info);
                     },
@@ -224,7 +224,7 @@ fn main() -> Result<()> {
                     timeout,
                 ),
                 cpal::SampleFormat::F32 => device.build_output_stream(
-                    &stream_config,
+                    stream_config,
                     move |data, callback_info| {
                         stream_callback.process::<f32>(data, callback_info);
                     },
@@ -287,6 +287,14 @@ pub struct AudioSystem {
 
 impl AudioSystem {
     pub fn run(&mut self) {
+        for stream in &self.output_streams {
+            stream.stream_common.stream.play().unwrap();
+        }
+
+        for stream in &self.input_streams {
+            stream.stream_common.stream.play().unwrap();
+        }
+
         let now = Instant::now();
         let mut last_rate_recalculate = now;
 
@@ -306,7 +314,7 @@ impl AudioSystem {
 
                 if let Some(timing_info) = stream.timing_info_rx.try_pop() {
                     if let Some(timing_accum) = stream.timing_accum.as_mut() {
-                        let prev_frames = timing_accum.total_frames;
+                        let _prev_frames = timing_accum.total_frames;
                         let _prev_time = timing_accum.prev_callback_time;
 
                         // A(t) = k0 + (k1 - k0) * (t - t0) / (t1 - t0)
@@ -315,8 +323,8 @@ impl AudioSystem {
                             .as_secs_f64();
                         let time_so_far =
                             (loop_start - timing_accum.prev_callback_time).as_secs_f64();
-                        let interpolated_frames = 0.0 as f64
-                            + timing_info.frames_written as f64 * (time_so_far / timespan);
+                        let _interpolated_frames =
+                            0.0_f64 + timing_info.frames_written as f64 * (time_so_far / timespan);
                         // dbg!(interpolated_frames);
 
                         // dbg!(prev_frames);
@@ -384,7 +392,7 @@ pub struct StreamCommon {
     num_channels: usize,
     sample_rate: usize,
     stream: cpal::Stream,
-    error_rx: RingBufferRx<StreamError>,
+    error_rx: RingBufferRx<cpal::Error>,
     total_frames: Arc<AtomicU64>,
     last_frames: u64,
     has_errored: bool,
