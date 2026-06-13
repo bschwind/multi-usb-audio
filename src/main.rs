@@ -9,8 +9,9 @@ use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
 };
 use rubato::{
-    Resampler, SincFixedIn, SincFixedOut, SincInterpolationParameters, SincInterpolationType,
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
+    audioadapter_buffers::direct::{SequentialSliceOfSlices, SequentialSliceOfVecs},
 };
 use std::{
     f64::consts::PI,
@@ -469,10 +470,23 @@ impl InputStream {
             let user_input_buffer = &mut user_input_buffers[self.input_buffer_index_start
                 ..(self.input_buffer_index_start + self.num_channels)];
 
-            match self.resampler.resampler.process_into_buffer(
+            let input = SequentialSliceOfVecs::new(
                 &self.resampler.input_buffer,
+                self.num_channels,
+                USER_BUFFER_SIZE,
+            )
+            .unwrap();
+            let output = SequentialSliceOfSlices::new_mut(
                 user_input_buffer,
-                None,
+                self.num_channels,
+                USER_BUFFER_SIZE,
+            )
+            .unwrap();
+
+            match self.resampler.resampler.process_into_buffer(
+                // &self.resampler.input_buffer,
+                &input, // user_input_buffer,
+                output, None,
             ) {
                 Ok((input_frames, _output_frames)) => {
                     // user_input_buffer is now ready for this stream
@@ -613,28 +627,30 @@ impl InputStreamCallback {
 }
 
 pub struct InputResampler {
-    resampler: SincFixedOut<f32>,
+    resampler: Async<f32>,
     input_buffer: Vec<Vec<f32>>,
 }
 
 impl InputResampler {
-    pub fn new(resampler: SincFixedOut<f32>) -> Self {
-        let filled = true;
-        let input_buffer = resampler.input_buffer_allocate(filled);
+    pub fn new(resampler: Async<f32>) -> Self {
+        // let filled = true;
+        // let input_buffer = resampler.input_buffer_allocate(filled);
+        let input_buffer = input_buffer_allocate(&resampler);
 
         Self { resampler, input_buffer }
     }
 }
 
 pub struct OutputResampler {
-    resampler: SincFixedIn<f32>,
+    resampler: Async<f32>,
     output_buffer: Vec<Vec<f32>>,
 }
 
 impl OutputResampler {
-    pub fn new(resampler: SincFixedIn<f32>) -> Self {
-        let filled = true;
-        let output_buffer = resampler.output_buffer_allocate(filled);
+    pub fn new(resampler: Async<f32>) -> Self {
+        // let filled = true;
+        // let output_buffer = resampler.output_buffer_allocate(filled);
+        let output_buffer = output_buffer_allocate(&resampler);
 
         Self { resampler, output_buffer }
     }
@@ -732,7 +748,7 @@ fn deinterleave_from_ring_buf<T: AsMut<[f32]>>(
     pop_iter.commit();
 }
 
-fn build_input_resampler(sample_rate: usize, num_channels: usize) -> SincFixedOut<f32> {
+fn build_input_resampler(sample_rate: usize, num_channels: usize) -> Async<f32> {
     let resample_ratio = NOMINAL_SAMPLE_RATE as f64 / sample_rate as f64;
     let max_relative_resample_ratio = 1.1;
     let params = SincInterpolationParameters {
@@ -744,11 +760,21 @@ fn build_input_resampler(sample_rate: usize, num_channels: usize) -> SincFixedOu
     };
     let chunk_size = USER_BUFFER_SIZE;
 
-    SincFixedOut::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
-        .expect("Should be able to construct the resampler")
+    Async::<f32>::new_sinc(
+        resample_ratio,
+        max_relative_resample_ratio,
+        &params,
+        chunk_size,
+        num_channels,
+        FixedAsync::Output,
+    )
+    .expect("Should be able to construct the resampler")
+
+    // SincFixedOut::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
+    //     .expect("Should be able to construct the resampler")
 }
 
-fn build_output_resampler(sample_rate: usize, num_channels: usize) -> SincFixedIn<f32> {
+fn build_output_resampler(sample_rate: usize, num_channels: usize) -> Async<f32> {
     let resample_ratio = sample_rate as f64 / NOMINAL_SAMPLE_RATE as f64;
     let max_relative_resample_ratio = 1.1;
     let params = SincInterpolationParameters {
@@ -760,6 +786,45 @@ fn build_output_resampler(sample_rate: usize, num_channels: usize) -> SincFixedI
     };
     let chunk_size = USER_BUFFER_SIZE;
 
-    SincFixedIn::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
-        .expect("Should be able to construct the resampler")
+    Async::<f32>::new_sinc(
+        resample_ratio,
+        max_relative_resample_ratio,
+        &params,
+        chunk_size,
+        num_channels,
+        FixedAsync::Input,
+    )
+    .expect("Should be able to construct the resampler")
+    // SincFixedIn::new(resample_ratio, max_relative_resample_ratio, params, chunk_size, num_channels)
+    //     .expect("Should be able to construct the resampler")
+}
+
+fn input_buffer_allocate(resampler: &Async<f32>) -> Vec<Vec<f32>> {
+    let num_frames = resampler.input_frames_max();
+    let num_channels = resampler.nbr_channels();
+
+    buffer_allocate(num_frames, num_channels)
+}
+
+fn output_buffer_allocate(resampler: &Async<f32>) -> Vec<Vec<f32>> {
+    let num_frames = resampler.output_frames_max();
+    let num_channels = resampler.nbr_channels();
+
+    buffer_allocate(num_frames, num_channels)
+}
+
+fn buffer_allocate(num_frames: usize, num_channels: usize) -> Vec<Vec<f32>> {
+    let mut buffer = Vec::with_capacity(num_channels);
+
+    for _ in 0..num_channels {
+        let mut channel = Vec::with_capacity(num_frames);
+
+        for _ in 0..num_frames {
+            channel.push(0.0);
+        }
+
+        buffer.push(channel);
+    }
+
+    buffer
 }

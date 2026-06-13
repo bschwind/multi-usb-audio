@@ -7,4 +7,4 @@ edition = "2024"
 anyhow = "1"
 cpal = "0.18"
 ringbuf = "0.5"
-rubato = { version = "0.16", default-features = false }
+rubato = { version = "3", default-features = false }
