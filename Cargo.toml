@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+atomic-wait = "1"
 cpal = "0.18"
 ringbuf = "0.5"
 rubato = { version = "0.16", default-features = false }

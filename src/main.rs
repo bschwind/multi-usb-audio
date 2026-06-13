@@ -16,7 +16,7 @@ use std::{
     f64::consts::PI,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -152,6 +152,7 @@ fn main() -> Result<()> {
                     has_errored: false,
                     measured_sample_rate: stream_config.sample_rate as f64,
                     last_sample_rate_calc_time: Instant::now(),
+                    atomic_driver: None,
                 },
                 sample_rx,
                 timing_info_rx,
@@ -186,10 +187,14 @@ fn main() -> Result<()> {
             let error_ring_buf = HeapRb::new(ERROR_BUFFER_SIZE);
             let (mut error_tx, error_rx) = error_ring_buf.split();
 
+            let atomic_driver =
+                if output_streams.is_empty() { Some(Arc::new(AtomicU32::new(0))) } else { None };
+
             let mut stream_callback = OutputStreamCallback {
                 num_channels,
                 sample_rx,
                 frame_count: Arc::clone(&frame_count),
+                atomic_driver: atomic_driver.as_ref().map(Arc::clone),
             };
 
             let stream = match output_format {
@@ -255,6 +260,7 @@ fn main() -> Result<()> {
                     has_errored: false,
                     measured_sample_rate: stream_config.sample_rate as f64,
                     last_sample_rate_calc_time: Instant::now(),
+                    atomic_driver,
                 },
                 sample_tx,
                 resampler: OutputResampler::new(resampler),
@@ -287,6 +293,8 @@ pub struct AudioSystem {
 
 impl AudioSystem {
     pub fn run(&mut self) {
+        let mut current_driver_val = 0;
+
         for stream in &self.output_streams {
             stream.stream_common.stream.play().unwrap();
         }
@@ -302,6 +310,25 @@ impl AudioSystem {
         dbg!(self.user_output_buffers.len());
 
         while now.elapsed() < Duration::from_secs(100) {
+            let atomic_driver = if !self.output_streams.is_empty() {
+                self.output_streams[0].stream_common.atomic_driver.as_ref().unwrap()
+            } else {
+                self.input_streams[0].stream_common.atomic_driver.as_ref().unwrap()
+            };
+
+            let old_driver_val = current_driver_val;
+
+            loop {
+                let new_driver_val = atomic_driver.load(Ordering::Acquire);
+
+                if new_driver_val != current_driver_val {
+                    current_driver_val = new_driver_val;
+                    break;
+                } else {
+                    atomic_wait::wait(atomic_driver, current_driver_val);
+                }
+            }
+
             let loop_start = Instant::now();
 
             for stream in &mut self.input_streams {
@@ -369,10 +396,6 @@ impl AudioSystem {
                     output_stream.write_to_ring_buffer(&self.user_output_buffers);
                 }
             }
-
-            // TODO(bschwind) - Find a way to drive this loop in a more efficient manner without using sleep.
-            //                  Maybe CondVars, or OS-specific wakeup events like eventfd or kqueue?
-            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -398,6 +421,7 @@ pub struct StreamCommon {
     has_errored: bool,
     measured_sample_rate: f64,
     last_sample_rate_calc_time: Instant,
+    atomic_driver: Option<Arc<AtomicU32>>,
 }
 
 impl StreamCommon {
@@ -690,6 +714,7 @@ pub struct OutputStreamCallback {
     num_channels: usize,
     sample_rx: RingBufferRx<f32>,
     frame_count: Arc<AtomicU64>,
+    atomic_driver: Option<Arc<AtomicU32>>,
 }
 
 impl OutputStreamCallback {
@@ -711,6 +736,11 @@ impl OutputStreamCallback {
 
         if did_underrun {
             // println!("underrun");
+        }
+
+        if let Some(atomic_driver) = &self.atomic_driver {
+            atomic_driver.fetch_add(1, Ordering::Release);
+            atomic_wait::wake_one(&**atomic_driver);
         }
     }
 }
